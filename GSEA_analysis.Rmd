@@ -1,0 +1,245 @@
+```{r libraries_setup}
+# ===========================
+# Load required libraries
+# ===========================
+library(fgsea)
+library(msigdbr)
+library(limma)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+
+# ===========================
+# Output directory for GSEA
+# ===========================
+output_dir <- "C:/Users/socla/Documents/results"
+gsea_dir   <- "C:/Users/socla/Documents/results/GSEA"
+```
+
+```{r GSEA}
+# ===========================
+# Prepare gene expression matrix (genes x samples)
+# Use log2 normalized values, samples ordered by Codi_Noray
+# ===========================
+expr_mat_gsea <- db_completa_log2 %>%
+  dplyr::select(Codi_Noray, starts_with("Endogenous_")) %>%
+  tibble::column_to_rownames(var = "Codi_Noray") %>%
+  as.matrix() %>%
+  t()  # genes x samples
+
+# Clean gene names: remove "Endogenous_" prefix AND "_NM_/_NR_/_XM_..." RefSeq suffix
+rownames(expr_mat_gsea) <- gsub("^Endogenous_", "", rownames(expr_mat_gsea))
+rownames(expr_mat_gsea) <- gsub("_(NM|NR|XM|XR|NP)_.*$", "", rownames(expr_mat_gsea))
+
+# Collapse duplicates if any (same HUGO symbol with multiple RefSeq IDs)
+if (any(duplicated(rownames(expr_mat_gsea)))) {
+  expr_mat_gsea <- limma::avereps(expr_mat_gsea, ID = rownames(expr_mat_gsea))
+}
+
+cat(sprintf("Genes after cleaning: %d\n", nrow(expr_mat_gsea)))
+
+# ===========================
+# Build pSTAT3 categorical variable (same cutoffs as heatmap)
+# ===========================
+clin_gsea <- db_completa_log2 %>%
+  dplyr::select(Codi_Noray, pSTAT3_Histoscore, PDL1) %>%
+  mutate(
+    pSTAT3_cat = cut(
+      pSTAT3_Histoscore,
+      breaks = c(-Inf, 29, 73, Inf),
+      labels = c("low", "intermediate", "high"),
+      right  = TRUE
+    )
+  )
+
+# Remove samples with missing pSTAT3
+clin_gsea <- clin_gsea %>% filter(!is.na(pSTAT3_cat))
+
+# ===========================
+# Load MSigDB gene sets: Hallmark + C2 canonical pathways
+# Updated for msigdbr >= 10.0.0
+# ===========================
+msig_h  <- msigdbr(species = "Homo sapiens", collection = "H")
+msig_c2 <- msigdbr(species = "Homo sapiens", collection = "C2") %>%
+  filter(grepl("^CP:", gs_subcollection))
+
+msig_all <- bind_rows(msig_h, msig_c2)
+
+# Build named list: pathway -> gene symbols
+gene_col <- if ("gene_symbol" %in% colnames(msig_all)) "gene_symbol" else "human_gene_symbol"
+pathways_list <- split(msig_all[[gene_col]], msig_all$gs_name)
+pathways_list <- lapply(pathways_list, unique)
+
+cat(sprintf("Pathways loaded: %d (Hallmark + C2:CP)\n", length(pathways_list)))
+
+# ===========================
+# Helper function: run limma + fgsea for a given comparison
+# ===========================
+run_gsea_comparison <- function(expr, clin, group_var, contrast_label,
+                                pathways, out_prefix) {
+
+  # Subset expression matrix to samples available in clin
+  samples_keep <- intersect(colnames(expr), clin$Codi_Noray)
+  expr_sub <- expr[, samples_keep, drop = FALSE]
+  clin_sub <- clin %>% filter(Codi_Noray %in% samples_keep)
+  clin_sub <- clin_sub[match(colnames(expr_sub), clin_sub$Codi_Noray), ]
+
+  group <- factor(clin_sub[[group_var]])
+
+  # Need at least 2 samples per group
+  tab <- table(group)
+  cat(sprintf("\n--- %s ---\n", contrast_label))
+  print(tab)
+  if (any(tab < 2) || length(levels(group)) < 2) {
+    cat("Not enough samples per group. Skipping.\n")
+    return(NULL)
+  }
+
+  # Design matrix: group2 vs group1 (reference = first level)
+  design <- model.matrix(~ group)
+  colnames(design) <- c("Intercept", "GroupEffect")
+
+  # Fit limma model to obtain a ranking statistic (moderated t)
+  fit  <- lmFit(expr_sub, design)
+  fit  <- eBayes(fit)
+  tt   <- topTable(fit, coef = "GroupEffect", number = Inf, sort.by = "none")
+
+  # Build ranked vector (named by gene symbol) using moderated t-statistic
+  ranks <- tt$t
+  names(ranks) <- rownames(tt)
+  ranks <- ranks[!is.na(ranks)]
+  ranks <- sort(ranks, decreasing = TRUE)
+
+  # Run fgsea
+  set.seed(123)
+  fgsea_res <- fgsea(
+    pathways = pathways,
+    stats    = ranks,
+    minSize  = 10,
+    maxSize  = 500
+  )
+
+  fgsea_res <- fgsea_res %>%
+    arrange(padj) %>%
+    as.data.frame()
+
+  # Save full results (collapse leadingEdge for CSV export)
+  fgsea_out <- fgsea_res
+  fgsea_out$leadingEdge <- sapply(fgsea_out$leadingEdge,
+                                  function(x) paste(x, collapse = ";"))
+  write.csv(fgsea_out,
+            file = file.path(gsea_dir, paste0(out_prefix, "_GSEA.csv")),
+            row.names = FALSE)
+
+  # Top 20 pathways by padj for plotting (LOLLIPOP version)
+  top_paths <- fgsea_res %>%
+    filter(!is.na(padj)) %>%
+    slice_head(n = 20)
+
+  if (nrow(top_paths) > 0) {
+    p <- ggplot(top_paths,
+                aes(x = NES, y = reorder(pathway, NES))) +
+      geom_segment(aes(x = 0, xend = NES,
+                       y = reorder(pathway, NES),
+                       yend = reorder(pathway, NES)),
+                   color = "grey70", linewidth = 0.4) +
+      geom_point(aes(size = size, color = padj < 0.05)) +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+      scale_color_manual(values = c("TRUE" = "#9A32CD", "FALSE" = "grey70"),
+                         name = "padj < 0.05") +
+      scale_size_continuous(range = c(2, 7), name = "Gene set size") +
+      coord_cartesian(xlim = c(-3, 3)) +
+      scale_x_continuous(breaks = seq(-3, 3, by = 1)) +
+      labs(
+        title = paste0("GSEA — ", contrast_label),
+        subtitle = "Top 20 pathways by adjusted p-value",
+        x = "Normalized Enrichment Score (NES)", y = NULL
+      ) +
+      theme_bw(base_size = 10) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        panel.grid.major.y = element_line(color = "grey95"),
+        panel.grid.minor = element_blank()
+      )
+    print(p)
+    
+    ggsave(
+      filename = file.path(gsea_dir, paste0(out_prefix, "_GSEA_top20.png")),
+      plot     = p,
+      width    = 10,
+      height   = 7,
+      dpi      = 300,
+      bg       = "white"
+    )
+  }
+
+  invisible(fgsea_res)
+}
+
+# ===========================
+# Comparison 1: low vs (intermediate + high) — ALL patients
+# ===========================
+clin_c1 <- clin_gsea %>%
+  mutate(group = ifelse(pSTAT3_cat == "low", "low", "int_high")) %>%
+  mutate(group = factor(group, levels = c("low", "int_high")))
+
+res1 <- run_gsea_comparison(
+  expr           = expr_mat_gsea,
+  clin           = clin_c1,
+  group_var      = "group",
+  contrast_label = "low vs intermediate+high (all patients)",
+  pathways       = pathways_list,
+  out_prefix     = "C1_low_vs_intHigh_all"
+)
+
+# ===========================
+# Comparison 2: low vs (intermediate + high) — PDL1+ only
+# ===========================
+clin_c2 <- clin_gsea %>%
+  filter(PDL1 == 1) %>%
+  mutate(group = ifelse(pSTAT3_cat == "low", "low", "int_high")) %>%
+  mutate(group = factor(group, levels = c("low", "int_high")))
+
+res2 <- run_gsea_comparison(
+  expr           = expr_mat_gsea,
+  clin           = clin_c2,
+  group_var      = "group",
+  contrast_label = "low vs intermediate+high (PDL1+ only)",
+  pathways       = pathways_list,
+  out_prefix     = "C2_low_vs_intHigh_PDL1pos"
+)
+
+# ===========================
+# Comparison 3: low vs high — ALL patients
+# ===========================
+clin_c3 <- clin_gsea %>%
+  filter(pSTAT3_cat %in% c("low", "high")) %>%
+  mutate(group = factor(pSTAT3_cat, levels = c("low", "high")))
+
+res3 <- run_gsea_comparison(
+  expr           = expr_mat_gsea,
+  clin           = clin_c3,
+  group_var      = "group",
+  contrast_label = "pSTAT3-high vs pSTAT3-low (all patients)",
+  pathways       = pathways_list,
+  out_prefix     = "C3_low_vs_high_all"
+)
+
+# ===========================
+# Comparison 4: low vs high — PDL1+ only
+# ===========================
+clin_c4 <- clin_gsea %>%
+  filter(PDL1 == 1, pSTAT3_cat %in% c("low", "high")) %>%
+  mutate(group = factor(pSTAT3_cat, levels = c("low", "high")))
+
+res4 <- run_gsea_comparison(
+  expr           = expr_mat_gsea,
+  clin           = clin_c4,
+  group_var      = "group",
+  contrast_label = "low vs high (PDL1+ only)",
+  pathways       = pathways_list,
+  out_prefix     = "C4_low_vs_high_PDL1pos"
+)
+
+cat("\nGSEA analysis complete. Results saved in:\n", gsea_dir, "\n")
+```

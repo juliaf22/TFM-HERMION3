@@ -1,0 +1,335 @@
+---
+title: "DE_analysis"
+author: "Júlia Francisco"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+    df_print: paged
+    self_contained: true
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+lang: es
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  error   = FALSE,
+  fig.align = "center",   # centra todas las figuras en el HTML
+  fig.width  = 10,        # ancho por defecto para figuras inline
+  fig.height = 6          # alto por defecto para figuras inline
+)
+```
+
+```{r Filtrado_por_LoD}
+de_dir <- file.path(results_dir, "07_differential_expression")
+dir.create(de_dir, showWarnings = FALSE, recursive = TRUE)
+
+# 10.1 separar endogenos y controles negativos (sobre la matriz normalizada)
+expr_norm <- assayDataElement(nanoStringData_norm, "exprs_norm")
+endo_idx <- fData(nanoStringData_norm)$CodeClass == "Endogenous"
+neg_idx <- fData(nanoStringData_norm)$CodeClass == "Negative"
+
+endo_expr  <- expr_norm[endo_idx, ]
+neg_expr   <- expr_norm[neg_idx, ]
+
+# 10.2 Límit de detecció per mostra: mean + 2·SD dels controls negatius
+lod_per_sample <- apply(neg_expr, 2, function(x) mean(x) + 2 * sd(x))
+
+# 10.3 Identificar mostres biològiques (exclou estàndards)
+# Ajusta el valor "Standard" si al teu SampleType s'anomena diferent
+bio_samples <- metadata$SampleType != "Standard"
+message("Mostres biològiques: ", sum(bio_samples),
+        " | Estàndards exclosos: ", sum(!bio_samples))
+
+# 10.4 Gen "detectat" si supera el LoD en ≥50% de mostres biològiques
+detected <- rowMeans(
+  sweep(endo_expr[, bio_samples], 2, lod_per_sample[bio_samples], ">=")
+) >= 0.5
+
+expr_de <- endo_expr[detected, bio_samples]
+message("Gens endògens detectats (passen LoD): ", sum(detected), " / ", length(detected))
+
+# 10.5 Transformar a log2 per a limma
+expr_de_log2 <- log2(expr_de + 1)
+
+# 10.6 Guardar matriu intermèdia
+write.csv(expr_de_log2, file.path(de_dir, "expression_matrix_for_DE.csv"))
+```
+
+```{r Anotacion_clinica_SAV}
+library(haven)
+
+# 11.1 Extraer HON ID de cada File Name con regex
+extract_hon_id <- function(filename) {
+  m <- regmatches(filename, regexpr("HON\\d+", filename))
+  if (length(m) == 0) NA_character_ else m
+}
+
+metadata$HON_ID <- sapply(metadata$SampleID, extract_hon_id)
+
+# Comprovació
+cat("HON IDs extrets:\n")
+print(head(metadata[, c("SampleID", "HON_ID", "Batch", "SampleType")]))
+
+n_missing <- sum(is.na(metadata$HON_ID))
+if (n_missing > 0) {
+  warning(n_missing, " mostres sense HON ID detectat. ",
+          "Revisa els noms: ", 
+          paste(metadata$SampleID[is.na(metadata$HON_ID)], collapse = ", "))
+}
+
+
+# 11.2 Cargar SAV
+clinical_file <- here("data", "Rawdata", "Base retrospectiva HERMION 16abr26_AMC_definitiva.sav")
+clinical_raw <- read_sav(clinical_file)
+
+# 11.2c Diagnòstic: inspeccionar la variable SPSS abans de convertir
+cat("Valors originals (numèrics) de Beneficio_clínico_a_6mo_inicioIT:\n")
+print(table(clinical_raw$Beneficio_clínico_a_6mo_inicioIT, useNA = "ifany"))
+
+cat("\nEtiquetes SPSS associades:\n")
+print(attr(clinical_raw$Beneficio_clínico_a_6mo_inicioIT, "labels"))
+
+cat("\nClasse de la variable:\n")
+print(class(clinical_raw$Beneficio_clínico_a_6mo_inicioIT))
+
+
+# 11.3 Convertir etiquetes SPSS a factors llegibles
+# (Beneficio_clínico_a_6mo_inicioIT probablement està codificada com 0/1 amb labels)
+clinical <- haven::as_factor(clinical_raw) |>
+  as.data.frame()
+
+# 11.4 Renombrar columnes conflictives (accents, noms llargs)
+names(clinical)[names(clinical) == "Beneficio_clínico_a_6mo_inicioIT"] <- "ClinicalBenefit"
+
+# 11.5 Inspeccionar la variable
+cat("Nivells de ClinicalBenefit:\n")
+print(table(clinical$ClinicalBenefit, useNA = "ifany"))
+
+# 11.6 Emparellament per Codi_Noray (conté HON IDs)
+clinical$HON_ID <- as.character(clinical$Codi_Noray)
+
+# Verificació de coincidència
+cat("HON IDs a NanoString (metadata):\n")
+print(sort(unique(na.omit(metadata$HON_ID))))
+
+cat("\nHON IDs al fitxer clínic (Codi_Noray):\n")
+print(sort(unique(clinical$HON_ID)))
+
+# Intersecció
+nano_ids  <- unique(na.omit(metadata$HON_ID))
+clin_ids  <- unique(clinical$HON_ID)
+matched   <- intersect(nano_ids, clin_ids)
+nano_only <- setdiff(nano_ids, clin_ids)
+clin_only <- setdiff(clin_ids, nano_ids)
+
+cat("\n--- Resum d'emparellament ---\n")
+cat("Mostres NanoString amb clínic:", length(matched), "/", length(nano_ids), "\n")
+cat("NanoString SENSE clínic:", paste(nano_only, collapse = ", "), "\n")
+cat("Clínic SENSE NanoString:", paste(clin_only, collapse = ", "), "\n")
+
+# 11.7 Merge: metadata ↔ clinical
+# Primer restringim a mostres biològiques (no standards)
+bio_samples  <- metadata$SampleType != "Standard"
+metadata_bio <- metadata[bio_samples, ]
+
+metadata_bio <- merge(metadata_bio, clinical,
+                      by = "HON_ID", all.x = TRUE, sort = FALSE)
+
+# Reordenar perquè coincideixi amb les columnes de expr_de_log2
+rownames(metadata_bio) <- metadata_bio$SampleID
+metadata_bio <- metadata_bio[colnames(expr_de_log2), ]
+
+stopifnot(identical(rownames(metadata_bio), colnames(expr_de_log2)))
+
+# 11.8 Comprovar mostres sense anotació clínica
+n_sense_anotacio <- sum(is.na(metadata_bio$ClinicalBenefit))
+if (n_sense_anotacio > 0) {
+  warning(n_sense_anotacio, " mostres biològiques sense ClinicalBenefit.")
+  print(metadata_bio[is.na(metadata_bio$ClinicalBenefit),
+                      c("SampleID", "HON_ID", "Batch", "SampleType")])
+}
+
+# Resum final
+cat("\n--- Metadata final per a DE ---\n")
+cat("Total mostres:", nrow(metadata_bio), "\n")
+cat("Distribució ClinicalBenefit × Batch:\n")
+print(table(metadata_bio$ClinicalBenefit, metadata_bio$Batch, useNA = "ifany"))
+
+write.csv(metadata_bio, file.path(de_dir, "metadata_bio_with_clinical.csv"),
+          row.names = FALSE)
+
+# Guardar metadata fusionada
+write.csv(metadata_bio, file.path(de_dir, "metadata_bio_with_clinical.csv"),
+          row.names = FALSE)
+```
+
+```{r DE_limma}
+# =========================================
+# 12. Expressió diferencial: ClinicalBenefit (No vs Sí)
+# =========================================
+
+# 12.1 Filtrar mostres sense anotació clínica
+keep <- !is.na(metadata_bio$ClinicalBenefit)
+metadata_de <- metadata_bio[keep, ]
+expr_de_mat <- expr_de_log2[, keep]
+
+stopifnot(identical(rownames(metadata_de), colnames(expr_de_mat)))
+
+# 12.2 Factor de comparació amb referència explícita
+# AJUSTA els nivells al que vegis a table(clinical$ClinicalBenefit)
+# Típicament "No"/"Sí" o "0"/"1"; "No" com a referència perquè logFC > 0 = up en "Sí"
+metadata_de$ClinicalBenefit <- factor(
+  metadata_de$ClinicalBenefit,
+  levels = c("No", "Sí")     # AJUSTA segons els valors reals
+)
+
+cat("Taula de disseny:\n")
+print(table(metadata_de$ClinicalBenefit, metadata_de$Batch))
+
+# 12.3 Matriu de disseny
+# Inclou Batch com a covariable (del limma previ vas veure si era rellevant)
+# Si Batch i ClinicalBenefit estan confosos, retira Batch del model
+design <- model.matrix(ClinicalBenefit, data = metadata_de)
+cat("Columnes del disseny:\n")
+print(colnames(design))
+
+# Comprovar rang complet (no multicol·linealitat severa)
+if (qr(design)$rank < ncol(design)) {
+  stop("Disseny singular: Batch i ClinicalBenefit poden estar confosos. ",
+       "Revisa la taula creuada de més amunt.")
+}
+
+# 12.4 Ajust limma
+fit <- lmFit(expr_de_mat, design)
+fit <- eBayes(fit, trend = TRUE, robust = TRUE)
+
+# 12.5 Extreure resultats del coeficient ClinicalBenefit
+coef_name <- grep("ClinicalBenefit", colnames(design), value = TRUE)
+cat("Coeficient extret:", coef_name, "\n")
+
+de_results <- topTable(fit, coef = coef_name, number = Inf,
+                        sort.by = "P", adjust.method = "BH")
+de_results$Gene <- rownames(de_results)
+
+# 12.6 Classificació de DEGs (FDR<0.05, |logFC|>log2(1.5)=0.58)
+de_results$Significance <- with(de_results,
+  ifelse(adj.P.Val < 0.1 & logFC >  0.58, "Up",
+  ifelse(adj.P.Val < 0.1 & logFC < -0.58, "Down", "NS")))
+
+cat("\nResum DEGs:\n")
+print(table(de_results$Significance))
+
+# Interpretació: "Up" = sobre-expressat en pacients amb benefici clínic
+# "Down" = sub-expressat en pacients amb benefici clínic
+
+# 12.7 Guardar resultats
+write.csv(de_results, file.path(de_dir, "DE_results_full.csv"), row.names = FALSE)
+write.csv(subset(de_results, Significance != "NS"),
+          file.path(de_dir, "DE_results_significant.csv"), row.names = FALSE)
+
+# 12.8 Top 20 DEGs per al log
+cat("\nTop 20 DEGs:\n")
+print(head(de_results[, c("Gene", "logFC", "P.Value", "adj.P.Val", "Significance")], 20))
+```
+
+```{r visualizacion}
+# =========================================
+# 13. Visualització de DEGs
+# =========================================
+
+# 13.1 Volcano plot
+volcano <- ggplot(de_results, aes(x = logFC, y = -log10(P.Value),
+                                   color = Significance)) +
+  geom_point(alpha = 0.7, size = 2) +
+  scale_color_manual(values = c("Up" = "firebrick", "Down" = "steelblue",
+                                 "NS" = "grey70")) +
+  geom_vline(xintercept = c(-0.58, 0.58), linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
+  geom_text_repel(
+    data = head(subset(de_results, Significance != "NS"), 20),
+    aes(label = Gene), size = 3, max.overlaps = 25, min.segment.length = 0
+  ) +
+  labs(title = "DEGs: Beneficio clínico a 6 meses",
+       subtitle = "Up = ↑ en pacients amb benefici",
+       x = "log2 Fold Change", y = "-log10(P value)") +
+  theme_minimal()
+
+save_and_show(volcano, file.path(de_dir, "volcano_plot.png"),
+              width = 10, height = 8)
+
+# 13.2 Heatmap dels DEGs significatius
+sig_genes <- subset(de_results, Significance != "NS")$Gene
+
+if (length(sig_genes) >= 2) {
+  heatmap_annot <- data.frame(
+    ClinicalBenefit = metadata_de$ClinicalBenefit,
+    Batch           = metadata_de$Batch,
+    row.names       = metadata_de$SampleID
+  )
+  
+  heatmap_mat <- expr_de_mat[sig_genes, ]
+  heatmap_mat_scaled <- t(scale(t(heatmap_mat)))  # z-score per gen
+  
+  # Saturar extrems per millorar contrast
+  heatmap_mat_scaled[heatmap_mat_scaled >  3] <-  3
+  heatmap_mat_scaled[heatmap_mat_scaled < -3] <- -3
+  
+  pheatmap(heatmap_mat_scaled,
+           annotation_col = heatmap_annot,
+           show_rownames  = length(sig_genes) <= 50,
+           show_colnames  = TRUE,
+           fontsize_row   = 7,
+           fontsize_col   = 7,
+           color = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+           main = paste("Heatmap:", length(sig_genes), "DEGs (z-score)"),
+           filename = file.path(de_dir, "heatmap_DEGs.png"),
+           width = 10, height = 8)
+  
+  knitr::include_graphics(file.path(de_dir, "heatmap_DEGs.png"))
+} else {
+  message("Menys de 2 DEGs significatius: heatmap no generat.")
+}
+
+# 13.3 Boxplots dels top DEGs
+top_n <- min(6, nrow(subset(de_results, Significance != "NS")))
+
+if (top_n > 0) {
+  top_genes <- head(subset(de_results, Significance != "NS"), top_n)$Gene
+  
+  top_long <- as.data.frame(t(expr_de_mat[top_genes, , drop = FALSE])) |>
+    tibble::rownames_to_column("SampleID") |>
+    tidyr::pivot_longer(-SampleID, names_to = "Gene", values_to = "Expression") |>
+    dplyr::left_join(
+      metadata_de[, c("SampleID", "ClinicalBenefit")],
+      by = "SampleID"
+    )
+  
+  p_top <- ggplot(top_long,
+                   aes(x = ClinicalBenefit, y = Expression, fill = ClinicalBenefit)) +
+    geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+    geom_jitter(width = 0.2, size = 1.8, alpha = 0.7) +
+    facet_wrap(~ Gene, scales = "free_y", ncol = 3) +
+    scale_fill_manual(values = c("No" = "steelblue", "Sí" = "firebrick")) +
+    labs(title = paste("Top", top_n, "DEGs"),
+         x = "Benefici clínic a 6 mesos",
+         y = "log2(Expressió + 1)") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  save_and_show(p_top, file.path(de_dir, "top_DEGs_boxplots.png"),
+                width = 12, height = 8)
+}
+```

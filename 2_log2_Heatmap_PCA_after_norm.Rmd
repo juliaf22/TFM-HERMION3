@@ -1,0 +1,1026 @@
+---
+title: "log2+Heatmap+PCA_after_norm"
+author: "Júlia Francisco"
+date: "2026-04-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# ===========================
+# Load required libraries
+# ===========================
+library(readr)
+library(pheatmap)
+library(dplyr)
+library(RColorBrewer)
+library(ggplot2)
+library(reshape2)
+library(tibble)
+library(patchwork)
+library(FactoMineR)
+library(factoextra)
+library(tidyr)
+library(haven)
+library(stringr)
+
+# ===========================
+# Define generic paths
+# ===========================
+input_dir         <- "C:/Users/socla/Documents/data/Datos_finales"
+clinicrawdata_dir <- "C:/Users/socla/Documents/data/Rawdata"
+output_dir        <- "C:/Users/socla/Documents/results/06_Results_Log2_Heatmap_PCA/"
+
+if (!dir.exists(output_dir)) dir.create(output_dir)
+
+# ===========================
+# Required input files
+# ===========================
+expr_file   <- file.path(input_dir, "final_normalized_matrix.csv")
+clinic_file <- file.path(clinicrawdata_dir, "Base retrospectiva HERMION 6MAIG2026 julia TFM.sav")
+```
+
+```{r data_preparation}
+# Load data
+gene_expr <- read_csv(expr_file)
+clinic_db <- read_sav(clinic_file) %>% zap_labels()
+
+# ===========================
+# Transpose and clean the matrix
+# ===========================
+gene_expr_t <- as.data.frame(t(gene_expr), stringsAsFactors = FALSE)
+colnames(gene_expr_t) <- gene_expr_t[1, ]
+gene_expr_t <- gene_expr_t[-1, ]
+gene_expr_t[] <- lapply(gene_expr_t, function(x) as.numeric(as.character(x)))
+
+# Apply log2 pseudocounts (avoid -Inf)
+min_no_zero <- min(gene_expr_t[gene_expr_t > 0], na.rm = TRUE)
+gene_expr_t_log2 <- log2(gene_expr_t + (min_no_zero / 2))
+gene_expr_t_log2 <- tibble::rownames_to_column(gene_expr_t_log2, var = "Sample_Name")
+
+# ===========================
+# Extract Codi_Noray from sample name
+# ===========================
+# "20260304_IO360RunA_HON2414_09.RCC" -> "HON2414"
+gene_expr_t_log2$Codi_Noray <- str_extract(gene_expr_t_log2$Sample_Name, "HON\\d+")
+
+cat("Extraction examples:\n")
+head(gene_expr_t_log2[, c("Sample_Name", "Codi_Noray")])
+
+n_match <- sum(gene_expr_t_log2$Codi_Noray %in% clinic_db$Codi_Noray)
+cat(sprintf("\nSamples with match: %d / %d\n", n_match, nrow(gene_expr_t_log2)))
+
+# ===========================
+# Sort and merge with clinical database
+# ===========================
+clinic_db_sorted <- clinic_db[order(match(clinic_db$Codi_Noray, gene_expr_t_log2$Codi_Noray)), ]
+db_completa_log2 <- merge(clinic_db_sorted, gene_expr_t_log2, by = "Codi_Noray")
+
+idx <- which(names(db_completa_log2) == "Beneficio_clinico_a_6mo_inicioIT")
+names(db_completa_log2)[idx] <- "clinical_benefit"
+
+write.csv(db_completa_log2, file = file.path(output_dir, "db_completa_log2.csv"), row.names = FALSE)
+
+# ===========================
+# Shared derived variables (used across heatmaps)
+# ===========================
+pSTAT3_cat <- cut(
+  db_completa_log2$pSTAT3_Histoscore,
+  breaks = c(-Inf, 29, 73, Inf),
+  labels = c("low", "intermediate", "high"),
+  right  = TRUE
+)
+
+resposta_terapeutica <- dplyr::case_when(
+  db_completa_log2$Mejor_respuesta_a_IT %in% c(0, 1) ~ "Responder",
+  db_completa_log2$Mejor_respuesta_a_IT %in% c(2, 3) ~ "No Responder",
+  TRUE ~ NA_character_
+)
+
+# ===========================
+# Shared annotation colors
+# ===========================
+annotation_colors_full <- list(
+  Clinical_Benefit     = c("Benefit" = "#9A32CD", "No Benefit" = "#00CED1"),
+  Resposta_Clinica     = c("RC" = "hotpink2", "RP" = "gold1",
+                           "EE" = "blue", "PE" = "steelblue3", "NE" = "grey"),
+  Resposta_Terapeutica = c("Responder" = "yellowgreen", "No Responder" = "salmon2"),
+  PDL1                 = c("Positive" = "orange", "Negative" = "dodgerblue", "Unknown" = "grey"),
+  CavOral              = c("Yes" = "khaki", "No" = "olivedrab"),
+  pSTAT3_Histoscore    = c("low" = "plum", "intermediate" = "rosybrown", "high" = "maroon")
+)
+```
+
+```{r Heatmap_log2_zscored}
+# ===========================
+# Select endogenous genes only
+# ===========================
+expr_matrix <- db_completa_log2 %>%
+  dplyr::select(Codi_Noray, starts_with("Endogenous_")) %>%
+  tibble::column_to_rownames(var = "Codi_Noray") %>%
+  as.matrix()
+
+annotation_df_exploratory <- data.frame(
+  row.names            = db_completa_log2$Codi_Noray,
+  Clinical_Benefit     = factor(db_completa_log2$clinical_benefit,
+                                levels = c(1, 0), labels = c("Benefit", "No Benefit")),
+  Resposta_Clinica     = factor(db_completa_log2$Mejor_respuesta_a_IT,
+                                levels = c(0, 1, 2, 3, 4), labels = c("RC", "RP", "EE", "PE", "NE")),
+  Resposta_Terapeutica = factor(resposta_terapeutica, levels = c("Responder", "No Responder")),
+  PDL1                 = factor(db_completa_log2$PDL1,
+                                levels = c(1, 0, 2), labels = c("Positive", "Negative", "Unknown")),
+  CavOral              = factor(db_completa_log2$CavOral_si_no,
+                                levels = c(1, 0), labels = c("Yes", "No")),
+  pSTAT3_Histoscore    = pSTAT3_cat
+)
+
+heatmap_args_exploratory <- list(
+  mat               = expr_matrix,
+  annotation_row    = annotation_df_exploratory,
+  annotation_colors = annotation_colors_full[names(annotation_df_exploratory)],
+  color             = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+  cluster_rows      = TRUE,
+  cluster_cols      = TRUE,
+  scale             = "column",
+  show_rownames     = TRUE,
+  show_colnames     = FALSE,
+  fontsize_row      = 6,
+  main              = "Gene Expression Heatmap (log2, Z-score per gene)",
+  border_color      = NA
+)
+
+pdf(file.path(output_dir, "Heatmap_exploratory.pdf"), width = 15, height = 10)
+do.call(pheatmap, heatmap_args_exploratory)
+dev.off()
+
+do.call(pheatmap, heatmap_args_exploratory)
+```
+
+```{r Heatmap_ALBA_signature}
+# ===========================
+# Select only the 5 ALBA signature genes
+# ===========================
+alba_genes <- c("IDO1", "CD38", "CXCL13", "CD27", "PNOC")
+
+alba_cols <- sapply(alba_genes, function(g) {
+  hits <- grep(paste0("Endogenous_", g, "_"), colnames(db_completa_log2), value = TRUE)
+  if (length(hits) == 0) stop(paste("Gen no trobat:", g))
+  if (length(hits) > 1)  warning(paste("Múltiples coincidències per:", g, "→ s'usa la primera:", hits[1]))
+  hits[1]
+})
+
+expr_matrix_alba <- db_completa_log2 %>%
+  dplyr::select(Codi_Noray, all_of(unname(alba_cols))) %>%
+  tibble::column_to_rownames(var = "Codi_Noray") %>%
+  as.matrix()
+colnames(expr_matrix_alba) <- alba_genes
+
+annotation_df_alba <- data.frame(
+  row.names            = db_completa_log2$Codi_Noray,
+  Clinical_Benefit     = factor(db_completa_log2$clinical_benefit,
+                                levels = c(1, 0), labels = c("Benefit", "No Benefit")),
+  Resposta_Clinica     = factor(db_completa_log2$Mejor_respuesta_a_IT,
+                                levels = c(0, 1, 2, 3, 4), labels = c("RC", "RP", "EE", "PE", "NE")),
+  Resposta_Terapeutica = factor(resposta_terapeutica, levels = c("Responder", "No Responder")),
+  PDL1                 = factor(db_completa_log2$PDL1,
+                                levels = c(1, 0, 2), labels = c("Positive", "Negative", "Unknown")),
+  CavOral              = factor(db_completa_log2$CavOral_si_no,
+                                levels = c(1, 0), labels = c("Yes", "No")),
+  pSTAT3_Histoscore    = pSTAT3_cat
+)
+
+heatmap_args_alba <- list(
+  mat               = expr_matrix_alba,
+  annotation_row    = annotation_df_alba,
+  annotation_colors = annotation_colors_full,
+  color             = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+  cluster_rows      = TRUE,
+  cluster_cols      = TRUE,
+  scale             = "column",
+  show_rownames     = TRUE,
+  show_colnames     = TRUE,
+  fontsize_row      = 6,
+  fontsize_col      = 11,
+  main              = "ALBA Signature – Gene Expression (log2, Z-score per gene)",
+  border_color      = NA
+)
+
+pdf(file.path(output_dir, "Heatmap_ALBA_signature.pdf"), width = 8, height = 10)
+do.call(pheatmap, heatmap_args_alba)
+dev.off()
+
+pheatmap_obj <- do.call(pheatmap, heatmap_args_alba)
+grid::grid.newpage()
+grid::grid.draw(pheatmap_obj$gtable)
+```
+
+
+
+```{r Heatmap_PDL1pos_pSTAT3high}
+# ===========================
+# Filter: PDL1 positive AND pSTAT3 high
+# ===========================
+mask_pdl1_stat3 <- db_completa_log2$PDL1 == 1 & pSTAT3_cat == "high"
+db_filtered <- db_completa_log2[mask_pdl1_stat3, ]
+pSTAT3_cat_filtered <- pSTAT3_cat[mask_pdl1_stat3]
+
+# Eliminar el NA de Codi_Noray
+na_idx <- is.na(db_filtered$Codi_Noray)
+db_filtered <- db_filtered[!na_idx, ]
+pSTAT3_cat_filtered <- pSTAT3_cat_filtered[!na_idx]
+
+cat(sprintf("Pacients PDL1+ i pSTAT3 high (sense NA): %d / %d\n",
+            nrow(db_filtered), nrow(db_completa_log2)))
+
+# ===========================
+# Select target genes
+# ===========================
+target_genes <- c("IL24", "PRKX", "TWIST2", "WNT10A")
+
+target_cols <- sapply(target_genes, function(g) {
+  hits <- grep(paste0("Endogenous_", g, "_"), colnames(db_filtered), value = TRUE)
+  if (length(hits) == 0) stop(paste("Gen no trobat:", g))
+  if (length(hits) > 1)  warning(paste("Múltiples coincidències per:", g, "→ s'usa la primera:", hits[1]))
+  hits[1]
+})
+
+# Construcció manual de la matriu
+tmp <- db_filtered %>%
+  dplyr::select(Codi_Noray, all_of(unname(target_cols))) %>%
+  as.data.frame()
+
+rownames(tmp) <- tmp$Codi_Noray
+tmp$Codi_Noray <- NULL
+expr_matrix_filtered <- as.matrix(tmp)
+colnames(expr_matrix_filtered) <- target_genes
+
+# ===========================
+# Annotation: Clinical Benefit + Resposta Clínica
+# ===========================
+annotation_df_filtered <- data.frame(
+  row.names        = db_filtered$Codi_Noray,
+  Clinical_Benefit = factor(db_filtered$clinical_benefit,
+                            levels = c(1, 0), labels = c("Benefit", "No Benefit")),
+  Resposta_Clinica = factor(db_filtered$Mejor_respuesta_a_IT,
+                            levels = c(0, 1, 2, 3, 4), labels = c("RC", "RP", "EE", "PE", "NE"))
+)
+
+heatmap_args_filtered <- list(
+  mat               = expr_matrix_filtered,
+  annotation_row    = annotation_df_filtered,
+  annotation_colors = annotation_colors_full[names(annotation_df_filtered)],
+  color             = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+  cluster_rows      = TRUE,
+  cluster_cols      = TRUE,
+  scale             = "column",
+  show_rownames     = TRUE,
+  show_colnames     = TRUE,
+  fontsize_row      = 8,
+  fontsize_col      = 11,
+  fontsize          = 10,
+  main              = "PDL1+ & pSTAT3 high – Gene Expression (log2, Z-score per gene)",
+  border_color      = NA
+)
+
+png(file.path(output_dir, "Heatmap_PDL1pos_pSTAT3high.png"), width = 7, height = 8,
+    units = "in", res = 300)
+do.call(pheatmap, heatmap_args_filtered)
+dev.off()
+
+pheatmap_obj_filtered <- do.call(pheatmap, heatmap_args_filtered)
+grid::grid.newpage()
+grid::grid.draw(pheatmap_obj_filtered$gtable)
+```
+
+```{r Heatmap_fullcohort_target_genes}
+# ===========================
+# Full cohort – WNT10A, IL24, PRKX, TWIST2
+# ===========================
+target_genes_full <- c("IL24", "PRKX", "TWIST2", "WNT10A")
+
+target_cols_full <- sapply(target_genes_full, function(g) {
+  hits <- grep(paste0("Endogenous_", g, "_"), colnames(db_completa_log2), value = TRUE)
+  if (length(hits) == 0) stop(paste("Gen no trobat:", g))
+  if (length(hits) > 1)  warning(paste("Múltiples coincidències per:", g, "→ s'usa la primera:", hits[1]))
+  hits[1]
+})
+
+tmp_full <- db_completa_log2 %>%
+  dplyr::select(Codi_Noray, all_of(unname(target_cols_full))) %>%
+  as.data.frame()
+
+rownames(tmp_full) <- tmp_full$Codi_Noray
+tmp_full$Codi_Noray <- NULL
+expr_matrix_full_target <- as.matrix(tmp_full)
+colnames(expr_matrix_full_target) <- target_genes_full
+
+# ===========================
+# Annotation: PDL1 + Clinical Benefit
+# ===========================
+annotation_df_full_target <- data.frame(
+  row.names        = db_completa_log2$Codi_Noray,
+  Clinical_Benefit = factor(db_completa_log2$clinical_benefit,
+                            levels = c(1, 0), labels = c("Benefit", "No Benefit")),
+  PDL1             = factor(db_completa_log2$PDL1,
+                            levels = c(1, 0, 2), labels = c("Positive", "Negative", "Unknown")),
+  pSTAT3_Histoscore    = pSTAT3_cat
+)
+
+heatmap_args_full_target <- list(
+  mat               = expr_matrix_full_target,
+  annotation_row    = annotation_df_full_target,
+  annotation_colors = annotation_colors_full[names(annotation_df_full_target)],
+  color             = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+  cluster_rows      = TRUE,
+  cluster_cols      = TRUE,
+  scale             = "column",
+  show_rownames     = TRUE,
+  show_colnames     = TRUE,
+  fontsize_row      = 8,
+  fontsize_col      = 11,
+  fontsize          = 10,
+  main              = "Full Cohort – WNT10A, IL24, PRKX, TWIST2 (log2, Z-score per gene)",
+  border_color      = NA
+)
+
+png(file.path(output_dir, "Heatmap_fullcohort_target_genes.png"), width = 7, height = 8,
+    units = "in", res = 300)
+do.call(pheatmap, heatmap_args_full_target)
+dev.off()
+
+pheatmap_obj_full_target <- do.call(pheatmap, heatmap_args_full_target)
+grid::grid.newpage()
+grid::grid.draw(pheatmap_obj_full_target$gtable)
+```
+
+```{r Heatmap_fullcohort_target_genes_supervised}
+# ===========================
+# Full cohort – WNT10A, IL24, PRKX, TWIST2 (supervised)
+# ===========================
+target_genes_full <- c("IL24", "PRKX", "TWIST2", "WNT10A")
+target_cols_full <- sapply(target_genes_full, function(g) {
+  hits <- grep(paste0("Endogenous_", g, "_"), colnames(db_completa_log2), value = TRUE)
+  if (length(hits) == 0) stop(paste("Gen no trobat:", g))
+  if (length(hits) > 1)  warning(paste("Múltiples coincidències per:", g, "→ s'usa la primera:", hits[1]))
+  hits[1]
+})
+
+tmp_full <- db_completa_log2 %>%
+  dplyr::select(Codi_Noray, all_of(unname(target_cols_full))) %>%
+  as.data.frame()
+rownames(tmp_full) <- tmp_full$Codi_Noray
+tmp_full$Codi_Noray <- NULL
+expr_matrix_full_target <- as.matrix(tmp_full)
+colnames(expr_matrix_full_target) <- target_genes_full
+
+# ===========================
+# Ordenació supervisada: PDL1 → pSTAT3 → Clinical Benefit
+# ===========================
+pdl1_order    <- c("Positive", "Unknown", "Negative")
+pstat3_order  <- c("high", "intermediate", "low")
+benefit_order <- c("Benefit", "No Benefit")
+
+recode_pdl1 <- function(x) {
+  ifelse(is.na(x), "Unknown",
+  ifelse(x == 1,   "Positive",
+  ifelse(x == 0,   "Negative", "Unknown")))
+}
+
+sort_key <- data.frame(
+  Codi_Noray   = db_completa_log2$Codi_Noray,
+  PDL1_sort    = factor(recode_pdl1(db_completa_log2$PDL1), levels = pdl1_order),
+  pSTAT3_sort  = factor(pSTAT3_cat, levels = pstat3_order),
+  Benefit_sort = factor(
+    ifelse(db_completa_log2$clinical_benefit == 1, "Benefit", "No Benefit"),
+    levels = benefit_order
+  ),
+  stringsAsFactors = FALSE
+)
+sort_key <- sort_key[order(sort_key$PDL1_sort, sort_key$pSTAT3_sort, sort_key$Benefit_sort), ]
+
+# ── Ajust manual: mou HON2528 just davant de HON2518 ──────────────────────────
+ordered_ids  <- sort_key$Codi_Noray
+idx_2528     <- which(ordered_ids == "HON2528")
+idx_2518     <- which(ordered_ids == "HON2518")
+ordered_ids  <- ordered_ids[-idx_2528]
+idx_2518_new <- which(ordered_ids == "HON2518")
+ordered_ids  <- append(ordered_ids, "HON2528", after = idx_2518_new - 1)
+sort_key     <- sort_key[match(ordered_ids, sort_key$Codi_Noray), ]
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Aplicar l'ordre a la matriu
+expr_matrix_full_target <- expr_matrix_full_target[sort_key$Codi_Noray, ]
+
+# ===========================
+# Annotation row
+# ===========================
+idx <- match(sort_key$Codi_Noray, db_completa_log2$Codi_Noray)
+annotation_df_full_target <- data.frame(
+  row.names        = sort_key$Codi_Noray,
+  PDL1             = factor(recode_pdl1(db_completa_log2$PDL1[idx]), levels = pdl1_order),
+  pSTAT3_Histoscore = factor(as.character(pSTAT3_cat[idx]), levels = pstat3_order),
+  Clinical_Benefit = factor(
+    ifelse(db_completa_log2$clinical_benefit[idx] == 1, "Benefit", "No Benefit"),
+    levels = benefit_order
+  )
+)
+
+# ===========================
+# Generar heatmap
+# ===========================
+heatmap_args_supervised <- list(
+  mat               = expr_matrix_full_target,
+  annotation_row    = annotation_df_full_target,
+  annotation_colors = annotation_colors_full,
+  cluster_rows      = FALSE,
+  cluster_cols      = TRUE,
+  scale             = "column",
+  color             = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+  main              = "Full Cohort – WNT10A, IL24, PRKX, TWIST2\n(supervised: PDL1 → pSTAT3 → Clinical Benefit)",
+  fontsize_row      = 7,
+  fontsize_col      = 10,
+  border_color      = NA,
+  filename          = file.path(output_dir, "heatmap_fullcohort_target_supervised.png"),
+  width             = 8,
+  height            = 6
+)
+do.call(pheatmap, heatmap_args_supervised)
+```
+
+```{r Heatmap_fullcohort_target_genes_supervised}
+# ===========================
+# Full cohort – WNT10A, IL24, PRKX, TWIST2 (supervised)
+# ===========================
+target_genes_full <- c("IL24", "PRKX", "TWIST2", "WNT10A")
+target_cols_full <- sapply(target_genes_full, function(g) {
+  hits <- grep(paste0("Endogenous_", g, "_"), colnames(db_completa_log2), value = TRUE)
+  if (length(hits) == 0) stop(paste("Gen no trobat:", g))
+  if (length(hits) > 1)  warning(paste("Múltiples coincidències per:", g, "→ s'usa la primera:", hits[1]))
+  hits[1]
+})
+
+tmp_full <- db_completa_log2 %>%
+  dplyr::select(Codi_Noray, all_of(unname(target_cols_full))) %>%
+  as.data.frame()
+rownames(tmp_full) <- tmp_full$Codi_Noray
+tmp_full$Codi_Noray <- NULL
+expr_matrix_full_target <- as.matrix(tmp_full)
+colnames(expr_matrix_full_target) <- target_genes_full
+
+# ===========================
+# Ordenació supervisada: PDL1 → pSTAT3 → Clinical Benefit
+# ===========================
+pdl1_order    <- c("Positive", "Unknown", "Negative")
+pstat3_order  <- c("high", "intermediate", "low")
+benefit_order <- c("Benefit", "No Benefit")
+response_order <- c("CR", "PR", "SD", "PD")
+
+recode_pdl1 <- function(x) {
+  ifelse(is.na(x), "Unknown",
+  ifelse(x == 1,   "Positive",
+  ifelse(x == 0,   "Negative", "Unknown")))
+}
+
+response_recode <- c("0" = "CR", "1" = "PR", "2" = "SD", "3" = "PD")
+
+sort_key <- data.frame(
+  Codi_Noray   = db_completa_log2$Codi_Noray,
+  PDL1_sort    = factor(recode_pdl1(db_completa_log2$PDL1), levels = pdl1_order),
+  pSTAT3_sort  = factor(pSTAT3_cat, levels = pstat3_order),
+  Benefit_sort = factor(
+    ifelse(db_completa_log2$clinical_benefit == 1, "Benefit", "No Benefit"),
+    levels = benefit_order
+  ),
+  stringsAsFactors = FALSE
+)
+sort_key <- sort_key[order(sort_key$PDL1_sort, sort_key$pSTAT3_sort, sort_key$Benefit_sort), ]
+
+# ── Ajust manual: mou HON2528 just davant de HON2518 ──────────────────────────
+ordered_ids  <- sort_key$Codi_Noray
+idx_2528     <- which(ordered_ids == "HON2528")
+idx_2518     <- which(ordered_ids == "HON2518")
+ordered_ids  <- ordered_ids[-idx_2528]
+idx_2518_new <- which(ordered_ids == "HON2518")
+ordered_ids  <- append(ordered_ids, "HON2528", after = idx_2518_new - 1)
+sort_key     <- sort_key[match(ordered_ids, sort_key$Codi_Noray), ]
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Aplicar l'ordre a la matriu
+expr_matrix_full_target <- expr_matrix_full_target[sort_key$Codi_Noray, ]
+
+# ===========================
+# Annotation row
+# ===========================
+idx <- match(sort_key$Codi_Noray, db_completa_log2$Codi_Noray)
+
+annotation_colors_full$Response <- c(
+  "CR" = "hotpink2",
+  "PR" = "gold1",
+  "SD" = "blue",
+  "PD" = "steelblue3"
+)
+
+annotation_df_full_target <- data.frame(
+  row.names         = sort_key$Codi_Noray,
+  PDL1              = factor(recode_pdl1(db_completa_log2$PDL1[idx]), levels = pdl1_order),
+  pSTAT3_Histoscore = factor(as.character(pSTAT3_cat[idx]), levels = pstat3_order),
+  Clinical_Benefit  = factor(
+    ifelse(db_completa_log2$clinical_benefit[idx] == 1, "Benefit", "No Benefit"),
+    levels = benefit_order
+  ),
+  Response          = factor(
+    response_recode[as.character(zap_labels(db_completa_log2$Mejor_respuesta_a_IT)[idx])],
+    levels = response_order
+  )
+)
+
+# ===========================
+# Generar heatmap
+# ===========================
+heatmap_args_supervised <- list(
+  mat               = expr_matrix_full_target,
+  annotation_row    = annotation_df_full_target,
+  annotation_colors = annotation_colors_full,
+  cluster_rows      = FALSE,
+  cluster_cols      = TRUE,
+  scale             = "column",
+  color             = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+  main              = "Full Cohort – WNT10A, IL24, PRKX, TWIST2\n(supervised: PDL1 → pSTAT3 → Clinical Benefit)",
+  fontsize_row      = 7,
+  fontsize_col      = 10,
+  border_color      = NA,
+  filename          = file.path(output_dir, "heatmap_fullcohort_target_supervised.png"),
+  width             = 8,
+  height            = 6
+)
+do.call(pheatmap, heatmap_args_supervised)
+```
+
+```{r Heatmap_fullcohort_selected_genes}
+# ===========================
+# Full cohort – WNT10A, IL24
+# ===========================
+target_genes_full <- c("IL24", "WNT10A")
+
+target_cols_full <- sapply(target_genes_full, function(g) {
+  hits <- grep(paste0("Endogenous_", g, "_"), colnames(db_completa_log2), value = TRUE)
+  if (length(hits) == 0) stop(paste("Gen no trobat:", g))
+  if (length(hits) > 1)  warning(paste("Múltiples coincidències per:", g, "→ s'usa la primera:", hits[1]))
+  hits[1]
+})
+
+tmp_full <- db_completa_log2 %>%
+  dplyr::select(Codi_Noray, all_of(unname(target_cols_full))) %>%
+  as.data.frame()
+
+rownames(tmp_full) <- tmp_full$Codi_Noray
+tmp_full$Codi_Noray <- NULL
+expr_matrix_full_target <- as.matrix(tmp_full)
+colnames(expr_matrix_full_target) <- target_genes_full
+
+# ===========================
+# Annotation: PDL1 + Clinical Benefit
+# ===========================
+annotation_df_full_target <- data.frame(
+  row.names        = db_completa_log2$Codi_Noray,
+  Clinical_Benefit = factor(db_completa_log2$clinical_benefit,
+                            levels = c(1, 0), labels = c("Benefit", "No Benefit")),
+  PDL1             = factor(db_completa_log2$PDL1,
+                            levels = c(1, 0, 2), labels = c("Positive", "Negative", "Unknown")),
+  pSTAT3_Histoscore    = pSTAT3_cat
+)
+
+heatmap_args_full_target <- list(
+  mat               = expr_matrix_full_target,
+  annotation_row    = annotation_df_full_target,
+  annotation_colors = annotation_colors_full[names(annotation_df_full_target)],
+  color             = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+  cluster_rows      = TRUE,
+  cluster_cols      = TRUE,
+  scale             = "column",
+  show_rownames     = TRUE,
+  show_colnames     = TRUE,
+  fontsize_row      = 8,
+  fontsize_col      = 11,
+  fontsize          = 10,
+  main              = "Full Cohort – WNT10A, IL24, (log2, Z-score per gene)",
+  border_color      = NA
+)
+
+png(file.path(output_dir, "Heatmap_fullcohort_selected_genes.png"), width = 7, height = 8,
+    units = "in", res = 300)
+do.call(pheatmap, heatmap_args_full_target)
+dev.off()
+
+pheatmap_obj_full_target <- do.call(pheatmap, heatmap_args_full_target)
+grid::grid.newpage()
+grid::grid.draw(pheatmap_obj_full_target$gtable)
+```
+
+```{r heatmap_supervised_upregulatedgenes_pSTAT3high_cohort}
+# ===========================
+# Full cohort – HLA-DRB5, HLA-DQA1, HLA-DQB1, KIR3DL2, REN, IL21R (supervised)
+# ===========================
+target_genes_full <- c("HLA-DRB5", "HLA-DQA1", "HLA-DQB1", "KIR3DL2")
+target_cols_full <- sapply(target_genes_full, function(g) {
+  hits <- grep(paste0("Endogenous_", g, "_"), colnames(db_completa_log2), value = TRUE)
+  if (length(hits) == 0) stop(paste("Gen no trobat:", g))
+  if (length(hits) > 1)  warning(paste("Múltiples coincidències per:", g, "→ s'usa la primera:", hits[1]))
+  hits[1]
+})
+
+tmp_full <- db_completa_log2 %>%
+  dplyr::select(Codi_Noray, all_of(unname(target_cols_full))) %>%
+  as.data.frame()
+rownames(tmp_full) <- tmp_full$Codi_Noray
+tmp_full$Codi_Noray <- NULL
+expr_matrix_full_target <- as.matrix(tmp_full)
+colnames(expr_matrix_full_target) <- target_genes_full
+
+# ===========================
+# Ordenació supervisada: PDL1 → pSTAT3 → Clinical Benefit → Response
+# ===========================
+pdl1_order     <- c("Positive", "Unknown", "Negative")
+pstat3_order   <- c("high", "intermediate", "low")
+benefit_order  <- c("Benefit", "No Benefit")
+response_order <- c("CR", "PR", "SD", "PD")
+
+recode_pdl1 <- function(x) {
+  ifelse(is.na(x), "Unknown",
+  ifelse(x == 1,   "Positive",
+  ifelse(x == 0,   "Negative", "Unknown")))
+}
+
+response_recode <- c("0" = "CR", "1" = "PR", "2" = "SD", "3" = "PD")
+
+sort_key <- data.frame(
+  Codi_Noray    = db_completa_log2$Codi_Noray,
+  PDL1_sort     = factor(recode_pdl1(db_completa_log2$PDL1), levels = pdl1_order),
+  pSTAT3_sort   = factor(pSTAT3_cat, levels = pstat3_order),
+  Benefit_sort  = factor(
+    ifelse(db_completa_log2$clinical_benefit == 1, "Benefit", "No Benefit"),
+    levels = benefit_order
+  ),
+  Response_sort = factor(
+    response_recode[as.character(zap_labels(db_completa_log2$Mejor_respuesta_a_IT))],
+    levels = response_order
+  ),
+  stringsAsFactors = FALSE
+)
+sort_key <- sort_key[order(sort_key$pSTAT3_sort, sort_key$PDL1_sort,
+                           sort_key$Benefit_sort, sort_key$Response_sort), ]
+
+# Aplicar l'ordre a la matriu
+expr_matrix_full_target <- expr_matrix_full_target[sort_key$Codi_Noray, ]
+
+# ===========================
+# Annotation row
+# ===========================
+idx <- match(sort_key$Codi_Noray, db_completa_log2$Codi_Noray)
+
+annotation_colors_full$Response <- c(
+  "CR" = "hotpink2",
+  "PR" = "gold1",
+  "SD" = "blue",
+  "PD" = "steelblue3"
+)
+
+annotation_df_full_target <- data.frame(
+  row.names         = sort_key$Codi_Noray,
+  pSTAT3_Histoscore = factor(as.character(pSTAT3_cat[idx]), levels = pstat3_order),
+  PDL1              = factor(recode_pdl1(db_completa_log2$PDL1[idx]), levels = pdl1_order),
+  Clinical_Benefit  = factor(
+    ifelse(db_completa_log2$clinical_benefit[idx] == 1, "Benefit", "No Benefit"),
+    levels = benefit_order
+  ),
+  Response          = factor(
+    response_recode[as.character(zap_labels(db_completa_log2$Mejor_respuesta_a_IT)[idx])],
+    levels = response_order
+  )
+)
+
+# ===========================
+# Generar heatmap
+# ===========================
+heatmap_args_supervised <- list(
+  mat               = expr_matrix_full_target,
+  annotation_row    = annotation_df_full_target,
+  annotation_colors = annotation_colors_full,
+  cluster_rows      = FALSE,
+  cluster_cols      = TRUE,
+  scale             = "column",
+  color             = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+  main              = "Full Cohort – HLA-DRB5, HLA-DQA1, HLA-DQB1, KIR3DL2, REN, IL21R\n(supervised: PDL1 → pSTAT3 → Clinical Benefit → Response)",
+  fontsize_row      = 7,
+  fontsize_col      = 10,
+  border_color      = NA,
+  filename          = file.path(output_dir, "heatmap_fullcohort_HLA_signature_supervised.png"),
+  width             = 8,
+  height            = 6
+)
+do.call(pheatmap, heatmap_args_supervised)
+```
+
+
+```{r heatmap_supervised_upregulatedgenes_pSTAT3high_cohort}
+# ===========================
+# PDL1+ cohort – HLA-DRB5, HLA-DQA1, HLA-DQB1, KIR3DL2, REN, IL21R (supervised)
+# ===========================
+
+# ── Filtre PDL1 positius ──────────────────────────────────────────────
+pdl1_pos_mask <- db_completa_log2$PDL1 == 1 & !is.na(db_completa_log2$PDL1)
+db_pdl1       <- db_completa_log2[pdl1_pos_mask, ]
+pSTAT3_cat_pdl1 <- pSTAT3_cat[pdl1_pos_mask]   # subconjunt alineat
+# ──────────────────────────────────────────────────────────────────────
+
+target_genes_full <- c("HLA-DRB5", "HLA-DQA1", "HLA-DQB1", "KIR3DL2", "REN", "IL21R")
+target_cols_full <- sapply(target_genes_full, function(g) {
+  hits <- grep(paste0("Endogenous_", g, "_"), colnames(db_pdl1), value = TRUE)
+  if (length(hits) == 0) stop(paste("Gen no trobat:", g))
+  if (length(hits) > 1)  warning(paste("Múltiples coincidències per:", g, "→ s'usa la primera:", hits[1]))
+  hits[1]
+})
+tmp_full <- db_pdl1 %>%
+  dplyr::select(Codi_Noray, all_of(unname(target_cols_full))) %>%
+  as.data.frame()
+rownames(tmp_full) <- tmp_full$Codi_Noray
+tmp_full$Codi_Noray <- NULL
+expr_matrix_full_target <- as.matrix(tmp_full)
+colnames(expr_matrix_full_target) <- target_genes_full
+
+# ===========================
+# Ordenació supervisada: pSTAT3 → Clinical Benefit → Response
+# ===========================
+pstat3_order   <- c("high", "intermediate", "low")
+benefit_order  <- c("Benefit", "No Benefit")
+response_order <- c("CR", "PR", "SD", "PD")
+
+response_recode <- c("0" = "CR", "1" = "PR", "2" = "SD", "3" = "PD")
+
+sort_key <- data.frame(
+  Codi_Noray    = db_pdl1$Codi_Noray,
+  pSTAT3_sort   = factor(pSTAT3_cat_pdl1, levels = pstat3_order),
+  Benefit_sort  = factor(
+    ifelse(db_pdl1$clinical_benefit == 1, "Benefit", "No Benefit"),
+    levels = benefit_order
+  ),
+  Response_sort = factor(
+    response_recode[as.character(zap_labels(db_pdl1$Mejor_respuesta_a_IT))],
+    levels = response_order
+  ),
+  stringsAsFactors = FALSE
+)
+sort_key <- sort_key[order(sort_key$pSTAT3_sort, sort_key$Benefit_sort,
+                           sort_key$Response_sort), ]
+
+# Aplicar l'ordre a la matriu
+expr_matrix_full_target <- expr_matrix_full_target[sort_key$Codi_Noray, ]
+
+# ===========================
+# Annotation row
+# ===========================
+idx <- match(sort_key$Codi_Noray, db_pdl1$Codi_Noray)
+
+annotation_colors_full$Response <- c(
+  "CR" = "hotpink2",
+  "PR" = "gold1",
+  "SD" = "blue",
+  "PD" = "steelblue3"
+)
+
+annotation_df_full_target <- data.frame(
+  row.names         = sort_key$Codi_Noray,
+  pSTAT3_Histoscore = factor(as.character(pSTAT3_cat_pdl1[idx]), levels = pstat3_order),
+  Clinical_Benefit  = factor(
+    ifelse(db_pdl1$clinical_benefit[idx] == 1, "Benefit", "No Benefit"),
+    levels = benefit_order
+  ),
+  Response          = factor(
+    response_recode[as.character(zap_labels(db_pdl1$Mejor_respuesta_a_IT)[idx])],
+    levels = response_order
+  )
+)
+
+# ===========================
+# Generar heatmap
+# ===========================
+heatmap_args_supervised <- list(
+  mat               = expr_matrix_full_target,
+  annotation_row    = annotation_df_full_target,
+  annotation_colors = annotation_colors_full,
+  cluster_rows      = FALSE,
+  cluster_cols      = TRUE,
+  scale             = "column",
+  color             = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+  main              = "PDL1+ Cohort – HLA-DRB5, HLA-DQA1, HLA-DQB1, KIR3DL2, REN, IL21R\n(supervised: pSTAT3 → Clinical Benefit → Response)",
+  fontsize_row      = 7,
+  fontsize_col      = 10,
+  border_color      = NA,
+  filename          = file.path(output_dir, "heatmap_PDL1pos_HLA_signature_supervised.png"),
+  width             = 8,
+  height            = 6
+)
+do.call(pheatmap, heatmap_args_supervised)
+```
+
+
+
+
+
+```{r PCA}
+# ===========================
+# Prepare endogenous expression matrix
+# ===========================
+endogenous_cols <- grep("^Endogenous", names(db_completa_log2), value = TRUE)
+gene_expression <- db_completa_log2[, endogenous_cols] %>% mutate_all(as.numeric)
+
+gene_expression[] <- lapply(gene_expression, function(x) {
+  ifelse(is.na(x), median(x, na.rm = TRUE), x)
+})
+
+scaled_expression <- scale(gene_expression)
+rownames(scaled_expression) <- db_completa_log2$ID
+pca.results <- PCA(scaled_expression, graph = FALSE, ncp = 10)
+
+# ===========================
+# Explained variance table
+# ===========================
+explained_variance <- pca.results$eig[, 2] / 100
+variance_table <- data.frame(
+  PC         = paste0("PC", 1:length(explained_variance)),
+  Variance   = round(explained_variance, 3),
+  Cumulative = round(cumsum(explained_variance), 3)
+)
+print(variance_table)
+write.csv(variance_table, file.path(output_dir, "PCA_variance_explained.csv"), row.names = FALSE)
+
+# ===========================
+# Top contributing genes to PC1 and PC2
+# ===========================
+loadings <- as.data.frame(pca.results$var$contrib[, 1:2])
+colnames(loadings) <- c("Contrib_PC1", "Contrib_PC2")
+loadings$Gene <- rownames(loadings)
+loadings <- loadings %>% arrange(desc(Contrib_PC1))
+
+cat("\n--- Top 20 genes contributing to PC1 ---\n")
+print(head(loadings, 20))
+write.csv(loadings, file.path(output_dir, "PCA_gene_contributions.csv"), row.names = FALSE)
+```
+
+```{r PCA_function}
+# ===========================
+# Reusable function: PCA plot colored by any clinical variable
+# ===========================
+plot_pca_by_var <- function(pca_results,
+                            clinical_var,
+                            var_levels,
+                            var_labels,
+                            colors,
+                            title,
+                            legend_title,
+                            explained_variance,
+                            ids = NULL) {
+  pca_data <- as.data.frame(pca_results$ind$coord[, 1:2])
+  pca_data$Group <- factor(clinical_var, levels = var_levels, labels = var_labels)
+  if (!is.null(ids)) pca_data$ID <- ids
+  pca_data <- pca_data[!is.na(pca_data$Group), ]
+
+  ggplot(pca_data, aes(x = Dim.1, y = Dim.2, color = Group)) +
+    geom_point(size = 3, alpha = 0.8) +
+    stat_ellipse(level = 0.95, linetype = "dashed", linewidth = 0.7) +
+    scale_color_manual(values = colors) +
+    labs(
+      title = title,
+      x     = paste0("PC1 (", round(explained_variance[1] * 100, 1), "%)"),
+      y     = paste0("PC2 (", round(explained_variance[2] * 100, 1), "%)"),
+      color = legend_title
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title    = element_text(hjust = 0.5, face = "bold", size = 12),
+      legend.position = "bottom"
+    )
+}
+```
+
+```{r PCA_all_variables}
+p_cb <- plot_pca_by_var(
+  pca_results      = pca.results,
+  clinical_var     = db_completa_log2$clinical_benefit,
+  var_levels       = c(1, 0),
+  var_labels       = c("Benefit", "No Benefit"),
+  colors           = annotation_colors_full$Clinical_Benefit,
+  title            = "Clinical Benefit",
+  legend_title     = "Clinical Benefit",
+  explained_variance = explained_variance,
+  ids              = db_completa_log2$ID
+)
+
+p_pdl1 <- plot_pca_by_var(
+  pca_results      = pca.results,
+  clinical_var     = db_completa_log2$PDL1,
+  var_levels       = c(1, 0, 2),
+  var_labels       = c("Positive", "Negative", "Unknown"),
+  colors           = annotation_colors_full$PDL1,
+  title            = "PD-L1 status",
+  legend_title     = "PD-L1",
+  explained_variance = explained_variance
+)
+
+p_resposta <- plot_pca_by_var(
+  pca_results      = pca.results,
+  clinical_var     = db_completa_log2$Mejor_respuesta_a_IT,
+  var_levels       = c(0, 1, 2, 3, 4),
+  var_labels       = c("RC", "RP", "EE", "PE", "NE"),
+  colors           = annotation_colors_full$Resposta_Clinica,
+  title            = "Clinical Response",
+  legend_title     = "Clinical_response",
+  explained_variance = explained_variance
+)
+
+p_loc1 <- plot_pca_by_var(
+  pca_results      = pca.results,
+  clinical_var     = db_completa_log2$Localización1º,
+  var_levels       = c(1, 2, 3, 4, 5),
+  var_labels       = c("Cavidad oral", "Orofaringe", "Hipofaringe", "Laringe", "COD"),
+  colors           = c("Cavidad oral" = "yellowgreen", "Orofaringe" = "#D95F02",
+                       "Hipofaringe" = "#7570B3", "Laringe" = "#E7298A", "COD" = "cyan3"),
+  title            = "Primary tumor site",
+  legend_title     = "Site",
+  explained_variance = explained_variance
+)
+
+p_smoke <- plot_pca_by_var(
+  pca_results      = pca.results,
+  clinical_var     = db_completa_log2$Tabaco,
+  var_levels       = c(0, 1, 2),
+  var_labels       = c("Nunca fumador", "Fumador", "Exfumador"),
+  colors           = c("Nunca fumador" = "#A6CEE3", "Fumador" = "#666666", "Exfumador" = "yellowgreen"),
+  title            = "Smoking status",
+  legend_title     = "Smoking",
+  explained_variance = explained_variance
+)
+
+p_sex <- plot_pca_by_var(
+  pca_results      = pca.results,
+  clinical_var     = db_completa_log2$Sexo,
+  var_levels       = c(0, 1),
+  var_labels       = c("Varón", "Mujer"),
+  colors           = c("Male" = "orange", "Female" = "purple"),
+  title            = "Sex",
+  legend_title     = "Sex",
+  explained_variance = explained_variance
+)
+
+p_CavOral <- plot_pca_by_var(
+  pca_results      = pca.results,
+  clinical_var     = db_completa_log2$CavOral_si_no,
+  var_levels       = c(0, 1),
+  var_labels       = c("No", "Yes"),
+  colors           = annotation_colors_full$CavOral,
+  title            = "CavOral",
+  legend_title     = "CavOral",
+  explained_variance = explained_variance
+)
+
+p_lineaIT <- plot_pca_by_var(
+  pca_results      = pca.results,
+  clinical_var     = db_completa_log2$Línea_IT,
+  var_levels       = c(1, 2, 3),
+  var_labels       = c("1ra", "2a", "3ra"),
+  colors           = c("1ra" = "thistle", "2a" = "tan2", "3ra" = "sienna3"),
+  title            = "Linea_IT",
+  legend_title     = "Linea_IT",
+  explained_variance = explained_variance
+)
+
+p_pSTAT3_HS <- plot_pca_by_var(
+  pca_results      = pca.results,
+  clinical_var     = db_completa_log2$pSTAT3_Histoscore_tercils,
+  var_levels       = c(0, 1, 2),
+  var_labels       = c("low", "intermediate", "high"),
+  colors           = annotation_colors_full$pSTAT3_Histoscore,
+  title            = "pSTAT3_HS",
+  legend_title     = "pSTAT3_HS",
+  explained_variance = explained_variance
+)
+```
+
+```{r PCA_combined_figure}
+combined_pca <- (p_cb | p_pdl1 | p_resposta) /
+                (p_loc1 | p_smoke | p_pSTAT3_HS) /
+                (p_CavOral | p_lineaIT) +
+  plot_annotation(
+    title = "PCA exploration across clinical variables",
+    theme = theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 16))
+  )
+
+print(combined_pca)
+
+ggsave(
+  file.path(output_dir, "PCA_combined_clinical_variables.png"),
+  combined_pca,
+  width = 18, height = 12, dpi = 300
+)
+```

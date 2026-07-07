@@ -1,0 +1,2338 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE, error = FALSE,
+  fig.align = "center", fig.width = 10, fig.height = 6
+)
+```
+
+```{r libraries_and_paths, include=FALSE}
+library(tidyverse)
+library(limma)
+library(EnhancedVolcano)
+library(pheatmap)
+library(ggrepel)
+library(stringr)
+library(grDevices)
+
+input_dir         <- "C:/Users/socla/Documents/data/Datos_finales"
+clinicrawdata_dir <- "C:/Users/socla/Documents/data/Rawdata"
+output_dir        <- "C:/Users/socla/Documents/results/07_Results_DEG_Limma/"
+if (!dir.exists(output_dir)) dir.create(output_dir)
+```
+
+```{r expression_matrix_and_metadata}
+expression_matrix <- db_completa_log2 %>%
+  dplyr::select(Codi_Noray, starts_with("Endogenous_")) %>%
+  as.data.frame() %>%
+  column_to_rownames("Codi_Noray") %>%
+  t() %>%
+  as.matrix()
+
+cat("Matrix dimensions (genes x samples):", dim(expression_matrix), "\n")
+
+metadata <- db_completa_log2 %>%
+  dplyr::select(Codi_Noray, clinical_benefit) %>%
+  mutate(
+    clinical_benefit = factor(clinical_benefit, levels = c(0, 1),
+                              labels = c("No_Benefit", "Benefit"))
+  ) %>%
+  column_to_rownames("Codi_Noray")
+
+metadata <- metadata[colnames(expression_matrix), , drop = FALSE]
+
+cat("Clinical benefit distribution:\n")
+print(table(metadata$clinical_benefit))
+```
+
+```{r funcio_DEG_volcano}
+# Funció generalitzada: accepta qualsevol variable de grup i qualsevol subset de dades.
+#
+# Paràmetres:
+#   data              — data frame amb Codi_Noray, columnes Endogenous_* i la variable de grup
+#   subset_label      — string curt per als noms de fitxer (sense espais)
+#   subset_description— string llegible per als títols del plot
+#   group_var         — nom de la columna de grup (string), p.ex. "clinical_benefit" o "pSTAT3_group"
+#   group_levels      — vector c("nivell_ref", "nivell_comparador") tal com apareixen a la columna
+#   group_labels      — vector c("label_ref", "label_comparador") per als plots i contrastos
+#   output_dir        — directori de sortida
+#   xlim_v, ylim_v    — límits dels eixos del volcano
+
+run_deg_volcano <- function(data,
+                            subset_label,
+                            subset_description,
+                            group_var,
+                            group_levels,
+                            group_labels,
+                            output_dir,
+                            xlim_v = c(-4, 4),
+                            ylim_v = c(0, 4)) {
+
+  # --- Expression matrix ---
+  expr_mat <- data %>%
+    dplyr::select(Codi_Noray, starts_with("Endogenous_")) %>%
+    as.data.frame() %>%
+    column_to_rownames("Codi_Noray") %>%
+    t() %>%
+    as.matrix()
+
+  # --- Metadata ---
+  meta <- data %>%
+    dplyr::select(Codi_Noray, all_of(group_var)) %>%
+    mutate(group = factor(.data[[group_var]],
+                          levels = group_levels,
+                          labels = group_labels)) %>%
+    filter(!is.na(group)) %>%
+    column_to_rownames("Codi_Noray")
+
+  common_samples <- intersect(colnames(expr_mat), rownames(meta))
+  expr_mat <- expr_mat[, common_samples]
+  meta     <- meta[common_samples, , drop = FALSE]
+
+  n_table <- table(meta$group)
+  n_ref   <- as.integer(n_table[group_labels[1]])
+  n_comp  <- as.integer(n_table[group_labels[2]])
+  n_total <- ncol(expr_mat)
+
+  cat("\n===== Subset:", subset_label, "=====\n")
+  cat("N total:", n_total,
+      "|", group_labels[2], ":", n_comp,
+      "|", group_labels[1], ":", n_ref, "\n")
+
+  if (any(n_table < 2)) {
+    warning("Subset '", subset_label, "' té un grup amb <2 pacients. Saltant anàlisi.")
+    return(NULL)
+  }
+
+  # --- Design + contrast + fit ---
+  safe_labels <- make.names(group_labels)
+  meta <- meta %>%
+    mutate(group = factor(group, levels = group_labels, labels = safe_labels))
+
+  design <- model.matrix(~0 + group, data = meta)
+  colnames(design) <- safe_labels
+
+  contrast_name <- paste0(safe_labels[2], "_vs_", safe_labels[1])
+  contrast <- makeContrasts(
+    contrasts = setNames(
+      paste0(safe_labels[2], " - ", safe_labels[1]),
+      contrast_name
+    ),
+    levels = design
+  )
+
+  fit <- lmFit(expr_mat, design) %>%
+    contrasts.fit(contrast) %>%
+    eBayes()
+
+  # --- Resultats ---
+  deg <- topTable(fit, number = Inf, adjust.method = "none", sort.by = "none") %>%
+    as.data.frame() %>%
+    rownames_to_column("gene") %>%
+    mutate(
+      gene_clean = gene %>%
+        str_extract("(?<=Endogenous_).*") %>%
+        str_remove("_[NX][MR]_\\d+\\.?\\d*$"),
+      direction = ifelse(logFC > 0,
+                         paste0("Up in ", group_labels[2]),
+                         paste0("Up in ", group_labels[1]))
+    ) %>%
+    arrange(P.Value)
+
+  write_csv(deg, file.path(output_dir,
+            paste0("DEG_results_", subset_label, ".csv")))
+
+  # --- Títols ---
+  genes_up_n   <- sum(deg$logFC >  1 & deg$P.Value < 0.05)
+  genes_down_n <- sum(deg$logFC < -1 & deg$P.Value < 0.05)
+
+  plot_title <- paste0("Subset: ", subset_description, "  |  N = ", n_total)
+  plot_subtitle <- paste0(
+    group_labels[2], " (n = ", n_comp, ")",
+    "  vs  ",
+    group_labels[1], " (n = ", n_ref, ")",
+    "\n[Up in ", group_labels[2], ": ", genes_up_n,
+    "  |  Down in ", group_labels[2], ": ", genes_down_n, "]"
+  )
+
+  # --- Etiquetes: NOMÉS gens DEG (p < 0.05 I |FC| > 1) ---
+  deg_rows      <- which(deg$P.Value < 0.05 & abs(deg$logFC) > 1 & !is.na(deg$gene_clean))
+  select_labels <- rep("", nrow(deg))
+  select_labels[deg_rows] <- deg$gene_clean[deg_rows]
+
+  cat("Gens DEG etiquetats:", select_labels[select_labels != ""], "\n")
+
+  # --- Volcano ---
+  v <- EnhancedVolcano(
+    deg,
+    lab             = select_labels,
+    selectLab       = select_labels[select_labels != ""],
+    x               = "logFC",
+    y               = "P.Value",
+    pCutoff         = 0.05,
+    FCcutoff        = 1,
+    title           = plot_title,
+    subtitle        = plot_subtitle,
+    col             = c("grey60",    # NS
+                        "grey60",    # només FC
+                        "steelblue", # només p < 0.05
+                        "red2"),     # p < 0.05 + FC > 1
+    colAlpha        = 0.7,
+    legendLabels    = c("Not significant", "Log2FC > 1", "P < 0.05",
+                        "P < 0.05 & Log2FC > 1"),
+    xlim            = xlim_v,
+    ylim            = ylim_v,
+    drawConnectors  = TRUE,
+    widthConnectors = 0.5,
+    max.overlaps    = Inf
+  )
+
+  print(v)
+  ggsave(file.path(output_dir, paste0("Volcano_", subset_label, ".png")),
+         plot = v, width = 10, height = 7, dpi = 300)
+
+  return(deg)
+}
+```
+
+```{r volcano_cohort_completa}
+deg_results <- run_deg_volcano(
+  data               = db_completa_log2,
+  subset_label       = "Benefit_vs_NoBenefit",
+  subset_description = "All patients",
+  group_var          = "clinical_benefit",
+  group_levels       = c(0, 1),
+  group_labels       = c("No_Benefit", "Benefit"),
+  output_dir         = output_dir
+)
+```
+
+```{r heatmap_7_DEGs}
+sig_genes      <- deg_results %>% filter(P.Value < 0.05) %>% pull(gene)
+heatmap_matrix <- expression_matrix[sig_genes, ]
+rownames(heatmap_matrix) <- str_extract(rownames(heatmap_matrix), "(?<=Endogenous_)[^_]+")
+heatmap_scaled <- t(scale(t(heatmap_matrix)))
+
+match_idx <- match(colnames(heatmap_matrix), db_completa_log2$Codi_Noray)
+
+pSTAT3_cat <- cut(
+  db_completa_log2$pSTAT3_Histoscore[match_idx],
+  breaks = c(-Inf, 29, 73, Inf),
+  labels = c("low", "intermediate", "high"),
+  right  = TRUE
+)
+
+annotation_col <- data.frame(
+  Clinical_Benefit  = factor(db_completa_log2$clinical_benefit[match_idx],
+                             levels = c(1, 0), labels = c("Benefit", "No_Benefit")),
+  PDL1              = factor(db_completa_log2$PDL1[match_idx],
+                             levels = c(1, 0, 2), labels = c("Positive", "Negative", "Unknown")),
+  CavOral           = factor(db_completa_log2$CavOral_si_no[match_idx],
+                             levels = c(1, 0), labels = c("Yes", "No")),
+  pSTAT3_Histoscore = pSTAT3_cat
+)
+rownames(annotation_col) <- colnames(heatmap_matrix)
+
+ann_colors <- list(
+  Clinical_Benefit  = c("Benefit" = "#9A32CD",    "No_Benefit"   = "#00CED1"),
+  PDL1              = c("Positive" = "orange",     "Negative"     = "steelblue", "Unknown" = "grey"),
+  CavOral           = c("Yes" = "khaki",           "No"           = "olivedrab"),
+  pSTAT3_Histoscore = c("low" = "plum",            "intermediate" = "rosybrown", "high"    = "maroon")
+)
+
+heatmap_args <- list(
+  mat               = heatmap_scaled,
+  annotation_col    = annotation_col,
+  annotation_colors = ann_colors,
+  cluster_rows      = TRUE,
+  cluster_cols      = TRUE,
+  show_colnames     = FALSE,
+  fontsize_row      = 11,
+  fontsize          = 10,
+  border_color      = NA,
+  main              = "Differentially Expressed Genes (P < 0.05)",
+  angle_col         = 45
+)
+
+do.call(pheatmap, heatmap_args)
+
+ggsave(
+  filename = file.path(output_dir, "Heatmap_7DEGs.png"),
+  plot     = do.call(pheatmap, heatmap_args),
+  width = 8, height = 5, dpi = 300
+)
+```
+
+```{r volcano_PDL1_positius}
+db_pdl1_pos <- db_completa_log2 %>%
+  mutate(PDL1 = haven::zap_labels(PDL1)) %>%
+  filter(PDL1 == 1)
+
+deg_pdl1 <- run_deg_volcano(
+  data               = db_pdl1_pos,
+  subset_label       = "PDL1_positive",
+  subset_description = "PDL1-positive patients",
+  group_var          = "clinical_benefit",
+  group_levels       = c(0, 1),
+  group_labels       = c("No_Benefit", "Benefit"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_no_cavOral}
+db_no_oc <- db_completa_log2 %>%
+  mutate(CavOral_si_no = haven::zap_labels(CavOral_si_no)) %>%
+  filter(CavOral_si_no == 0)
+
+deg_no_oc <- run_deg_volcano(
+  data               = db_no_oc,
+  subset_label       = "No_OralCavity",
+  subset_description = "Non-oral cavity HNSCC",
+  group_var          = "clinical_benefit",
+  group_levels       = c(0, 1),
+  group_labels       = c("No_Benefit", "Benefit"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_si_cavOral}
+db_si_oc <- db_completa_log2 %>%
+  mutate(CavOral_si_no = haven::zap_labels(CavOral_si_no)) %>%
+  filter(CavOral_si_no == 1)
+
+deg_si_oc <- run_deg_volcano(
+  data               = db_si_oc,
+  subset_label       = "OralCavity",
+  subset_description = "Oral cavity HNSCC",
+  group_var          = "clinical_benefit",
+  group_levels       = c(0, 1),
+  group_labels       = c("No_Benefit", "Benefit"),
+  output_dir         = output_dir
+)
+```
+
+# ── Nous volcanos: anàlisi per pSTAT3 ─────────────────────────────────────────
+
+```{r preparar_pSTAT3_subsets}
+# Categoritzem pSTAT3 en un sol lloc per reutilitzar-ho als 3 chunks següents.
+# Breaks: low ≤ 29 < intermediate ≤ 73 < high  (mateixos que al heatmap)
+db_pstat3 <- db_completa_log2 %>%
+  mutate(
+    pSTAT3_group = cut(
+      haven::zap_labels(pSTAT3_Histoscore),
+      breaks = c(-Inf, 29, 73, Inf),
+      labels = c("low", "intermediate", "high"),
+      right  = TRUE
+    )
+  )
+
+cat("Distribució pSTAT3_group:\n")
+print(table(db_pstat3$pSTAT3_group, useNA = "ifany"))
+
+# Subsets low i high (exclou intermediate per als comparadors 2 i 3)
+db_pstat3_low  <- db_pstat3 %>% filter(pSTAT3_group == "low")
+db_pstat3_high <- db_pstat3 %>% filter(pSTAT3_group == "high")
+```
+
+```{r volcano_pSTAT3_low_vs_high}
+# Comparació 1: tots els pacients, pSTAT3 low vs high
+# (s'exclouen automàticament els intermediate perquè no estan en group_levels)
+deg_pstat3_lowVShigh <- run_deg_volcano(
+  data               = db_pstat3,
+  subset_label       = "pSTAT3_High_vs_Low",
+  subset_description = "All patients",
+  group_var          = "pSTAT3_group",
+  group_levels       = c("low", "high"),   # ref = low, comparador = high
+  group_labels       = c("pSTAT3_Low", "pSTAT3_High"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_pSTAT3_low_vs_high_PDL1pos}
+# PDL1-positive patients, pSTAT3 low vs high
+# (intermediate s'exclouen automàticament perquè no estan en group_levels)
+db_pstat3_pdl1pos <- db_pstat3 %>%
+  mutate(PDL1 = haven::zap_labels(PDL1)) %>%
+  filter(PDL1 == 1)
+
+deg_pstat3_lowVShigh_PDL1pos <- run_deg_volcano(
+  data               = db_pstat3_pdl1pos,
+  subset_label       = "pSTAT3_High_vs_Low_PDL1pos",
+  subset_description = "PDL1-positive patients",
+  group_var          = "pSTAT3_group",
+  group_levels       = c("low", "high"),
+  group_labels       = c("pSTAT3_Low", "pSTAT3_High"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_pSTAT3low_benefit}
+# Comparació 2: subset pSTAT3 low → benefici clínic vs no benefici
+deg_pstat3low_benefit <- run_deg_volcano(
+  data               = db_pstat3_low,
+  subset_label       = "pSTAT3low_Benefit_vs_NoBenefit",
+  subset_description = "pSTAT3-low patients",
+  group_var          = "clinical_benefit",
+  group_levels       = c(0, 1),
+  group_labels       = c("No_Benefit", "Benefit"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_pSTAT3high_benefit}
+# Comparació 3: subset pSTAT3 high → benefici clínic vs no benefici
+deg_pstat3high_benefit <- run_deg_volcano(
+  data               = db_pstat3_high,
+  subset_label       = "pSTAT3high_Benefit_vs_NoBenefit",
+  subset_description = "pSTAT3-high patients",
+  group_var          = "clinical_benefit",
+  group_levels       = c(0, 1),
+  group_labels       = c("No_Benefit", "Benefit"),
+  output_dir         = output_dir
+)
+```
+
+
+
+
+# ── Nous volcanos: anàlisi per resposta RECIST ────────────────────────────────
+
+```{r preparar_RECIST_subsets}
+# Codificació: 0=RC, 1=RP, 2=EE, 3=PE, 4=NA
+# Comparació 1: RC vs PE
+# Comparació 2: Control malaltia (RC+RP+EE) vs PE
+
+db_recist <- db_completa_log2 %>%
+  mutate(
+    Mejor_respuesta_a_IT = haven::zap_labels(Mejor_respuesta_a_IT),
+    
+    # Grup per RC vs PE
+    recist_RC_vs_PE = case_when(
+      Mejor_respuesta_a_IT == 0 ~ "RC",
+      Mejor_respuesta_a_IT == 3 ~ "PE",
+      TRUE ~ NA_character_
+    ),
+    
+    # Grup per control malaltia vs PE
+    recist_DCR_vs_PE = case_when(
+      Mejor_respuesta_a_IT %in% c(0, 1, 2) ~ "DCR",
+      Mejor_respuesta_a_IT == 3             ~ "PE",
+      TRUE ~ NA_character_
+    )
+  )
+
+cat("Distribució Mejor_respuesta_a_IT (original):\n")
+print(table(db_recist$Mejor_respuesta_a_IT, useNA = "ifany"))
+
+cat("\nRC vs PE:\n")
+print(table(db_recist$recist_RC_vs_PE, useNA = "ifany"))
+
+cat("\nDCR vs PE:\n")
+print(table(db_recist$recist_DCR_vs_PE, useNA = "ifany"))
+```
+
+```{r volcano_RC_vs_PE}
+# RC vs PE — tots els pacients
+deg_RC_vs_PE <- run_deg_volcano(
+  data               = db_recist,
+  subset_label       = "RC_vs_PE",
+  subset_description = "All patients",
+  group_var          = "recist_RC_vs_PE",
+  group_levels       = c("PE", "RC"),
+  group_labels       = c("Progressive Disease", "Complete Response"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_DCR_vs_PE}
+# DCR vs PE — tots els pacients
+deg_DCR_vs_PE <- run_deg_volcano(
+  data               = db_recist,
+  subset_label       = "DCR_vs_PE",
+  subset_description = "All patients",
+  group_var          = "recist_DCR_vs_PE",
+  group_levels       = c("PE", "DCR"),
+  group_labels       = c("Progressive Disease", "Disease Control (CR+PR+SD)"),
+  output_dir         = output_dir
+)
+```
+
+
+```{r volcano_RC_vs_PE_PDL1pos}
+# RC vs PE — PDL1-positius
+db_recist_pdl1pos <- db_recist %>%
+  mutate(PDL1 = haven::zap_labels(PDL1)) %>%
+  filter(PDL1 == 1)
+
+deg_RC_vs_PE_pdl1 <- run_deg_volcano(
+  data               = db_recist_pdl1pos,
+  subset_label       = "RC_vs_PE_PDL1pos",
+  subset_description = "PDL1-positive patients",
+  group_var          = "recist_RC_vs_PE",
+  group_levels       = c("PE", "RC"),
+  group_labels       = c("Progressive Disease", "Complete Response"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_DCR_vs_PE_PDL1pos}
+# DCR vs PE — PDL1-positius
+deg_DCR_vs_PE_pdl1 <- run_deg_volcano(
+  data               = db_recist_pdl1pos,
+  subset_label       = "DCR_vs_PE_PDL1pos",
+  subset_description = "PDL1-positive patients",
+  group_var          = "recist_DCR_vs_PE",
+  group_levels       = c("PE", "DCR"),
+  group_labels       = c("Progressive Disease", "Disease Control (CR+PR+SD)"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_RC_vs_PE_noCavOral}
+# RC vs PE — no cavitat oral
+db_recist_noOC <- db_recist %>%
+  mutate(CavOral_si_no = haven::zap_labels(CavOral_si_no)) %>%
+  filter(CavOral_si_no == 0)
+
+deg_RC_vs_PE_noOC <- run_deg_volcano(
+  data               = db_recist_noOC,
+  subset_label       = "RC_vs_PE_NoOralCavity",
+  subset_description = "Non-oral cavity patients",
+  group_var          = "recist_RC_vs_PE",
+  group_levels       = c("PE", "RC"),
+  group_labels       = c("Progressive Disease", "Complete Response"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_DCR_vs_PE_noCavOral}
+# DCR vs PE — no cavitat oral
+deg_DCR_vs_PE_noOC <- run_deg_volcano(
+  data               = db_recist_noOC,
+  subset_label       = "DCR_vs_PE_NoOralCavity",
+  subset_description = "Non-oral cavity patients",
+  group_var          = "recist_DCR_vs_PE",
+  group_levels       = c("PE", "DCR"),
+  group_labels       = c("Progressive Disease", "Disease Control (CR+PR+SD)"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_RC_vs_PE_siCavOral}
+# RC vs PE — cavitat oral
+db_recist_siOC <- db_recist %>%
+  mutate(CavOral_si_no = haven::zap_labels(CavOral_si_no)) %>%
+  filter(CavOral_si_no == 1)
+
+deg_RC_vs_PE_siOC <- run_deg_volcano(
+  data               = db_recist_siOC,
+  subset_label       = "RC_vs_PE_OralCavity",
+  subset_description = "Oral cavity patients",
+  group_var          = "recist_RC_vs_PE",
+  group_levels       = c("PE", "RC"),
+  group_labels       = c("Progressive Disease", "Complete Response"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_DCR_vs_PE_siCavOral}
+# DCR vs PE — cavitat oral
+deg_DCR_vs_PE_siOC <- run_deg_volcano(
+  data               = db_recist_siOC,
+  subset_label       = "DCR_vs_PE_OralCavity",
+  subset_description = "Oral cavity patients",
+  group_var          = "recist_DCR_vs_PE",
+  group_levels       = c("PE", "DCR"),
+  group_labels       = c("Progressive Disease", "Disease Control (CR+PR+SD)"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_RC_vs_PE_pSTAT3}
+# Preparar pSTAT3 + RECIST conjuntament
+db_recist_pstat3 <- db_recist %>%
+  mutate(
+    pSTAT3_group = cut(
+      haven::zap_labels(pSTAT3_Histoscore),
+      breaks = c(-Inf, 29, 73, Inf),
+      labels = c("low", "intermediate", "high"),
+      right  = TRUE
+    )
+  )
+
+db_recist_pstat3_low  <- db_recist_pstat3 %>% filter(pSTAT3_group == "low")
+db_recist_pstat3_high <- db_recist_pstat3 %>% filter(pSTAT3_group == "high")
+```
+
+```{r volcano_RC_vs_PE_pSTAT3low}
+# RC vs PE — pSTAT3 low
+deg_RC_vs_PE_plow <- run_deg_volcano(
+  data               = db_recist_pstat3_low,
+  subset_label       = "RC_vs_PE_pSTAT3low",
+  subset_description = "pSTAT3-low patients",
+  group_var          = "recist_RC_vs_PE",
+  group_levels       = c("PE", "RC"),
+  group_labels       = c("Progressive Disease", "Complete Response"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_DCR_vs_PE_pSTAT3low}
+# DCR vs PE — pSTAT3 low
+deg_DCR_vs_PE_plow <- run_deg_volcano(
+  data               = db_recist_pstat3_low,
+  subset_label       = "DCR_vs_PE_pSTAT3low",
+  subset_description = "pSTAT3-low patients",
+  group_var          = "recist_DCR_vs_PE",
+  group_levels       = c("PE", "DCR"),
+  group_labels       = c("Progressive Disease", "Disease Control (CR+PR+SD)"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_RC_vs_PE_pSTAT3high}
+# RC vs PE — pSTAT3 high
+deg_RC_vs_PE_phigh <- run_deg_volcano(
+  data               = db_recist_pstat3_high,
+  subset_label       = "RC_vs_PE_pSTAT3high",
+  subset_description = "pSTAT3-high patients",
+  group_var          = "recist_RC_vs_PE",
+  group_levels       = c("PE", "RC"),
+  group_labels       = c("Progressive Disease", "Complete Response"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_DCR_vs_PE_pSTAT3high}
+# DCR vs PE — pSTAT3 high
+deg_DCR_vs_PE_phigh <- run_deg_volcano(
+  data               = db_recist_pstat3_high,
+  subset_label       = "DCR_vs_PE_pSTAT3high",
+  subset_description = "pSTAT3-high patients",
+  group_var          = "recist_DCR_vs_PE",
+  group_levels       = c("PE", "DCR"),
+  group_labels       = c("Progressive Disease", "Disease Control (CR+PR+SD)"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_pSTAT3_low_vs_high_no_cavOral}
+# Non-oral cavity HNSCC, pSTAT3 low vs high
+db_pstat3_no_oc <- db_pstat3 %>%
+  mutate(CavOral_si_no = haven::zap_labels(CavOral_si_no)) %>%
+  filter(CavOral_si_no == 0)
+
+deg_pstat3_lowVShigh_no_oc <- run_deg_volcano(
+  data               = db_pstat3_no_oc,
+  subset_label       = "pSTAT3_High_vs_Low_No_OralCavity",
+  subset_description = "Non-oral cavity HNSCC",
+  group_var          = "pSTAT3_group",
+  group_levels       = c("low", "high"),
+  group_labels       = c("pSTAT3_Low", "pSTAT3_High"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_pSTAT3_low_vs_high_si_cavOral}
+# Oral cavity HNSCC, pSTAT3 low vs high
+db_pstat3_si_oc <- db_pstat3 %>%
+  mutate(CavOral_si_no = haven::zap_labels(CavOral_si_no)) %>%
+  filter(CavOral_si_no == 1)
+
+deg_pstat3_lowVShigh_si_oc <- run_deg_volcano(
+  data               = db_pstat3_si_oc,
+  subset_label       = "pSTAT3_High_vs_Low_OralCavity",
+  subset_description = "Oral cavity HNSCC",
+  group_var          = "pSTAT3_group",
+  group_levels       = c("low", "high"),
+  group_labels       = c("pSTAT3_Low", "pSTAT3_High"),
+  output_dir         = output_dir
+)
+```
+
+
+
+
+
+
+```{r preparar_responders_subsets}
+# Codificació: 0=RC, 1=RP, 2=EE, 3=PE, 4=NA
+# Responedors: RC (0) + RP (1)
+# No responedors: EE (2) + PE (3)
+
+db_responders <- db_completa_log2 %>%
+  mutate(
+    Mejor_respuesta_a_IT = haven::zap_labels(Mejor_respuesta_a_IT),
+    responder_group = case_when(
+      Mejor_respuesta_a_IT %in% c(0, 1) ~ "Responder",
+      Mejor_respuesta_a_IT %in% c(2, 3) ~ "Non_Responder",
+      TRUE ~ NA_character_
+    )
+  )
+
+cat("Distribució responder_group:\n")
+print(table(db_responders$responder_group, useNA = "ifany"))
+```
+```{r volcano_responders_all}
+# All patients — Responedors vs No Responedors
+deg_resp_all <- run_deg_volcano(
+  data               = db_responders,
+  subset_label       = "Responders_vs_NonResponders_All",
+  subset_description = "All patients",
+  group_var          = "responder_group",
+  group_levels       = c("Non_Responder", "Responder"),
+  group_labels       = c("Non-Responder (SD+PD)", "Responder (CR+PR)"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_responders_PDL1pos}
+# PDL1-positive — Responedors vs No Responedors
+db_resp_pdl1pos <- db_responders %>%
+  mutate(PDL1 = haven::zap_labels(PDL1)) %>%
+  filter(PDL1 == 1)
+
+deg_resp_pdl1 <- run_deg_volcano(
+  data               = db_resp_pdl1pos,
+  subset_label       = "Responders_vs_NonResponders_PDL1pos",
+  subset_description = "PDL1-positive patients",
+  group_var          = "responder_group",
+  group_levels       = c("Non_Responder", "Responder"),
+  group_labels       = c("Non-Responder (SD+PD)", "Responder (CR+PR)"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_responders_noOC}
+# Non-oral cavity — Responedors vs No Responedors
+db_resp_noOC <- db_responders %>%
+  mutate(CavOral_si_no = haven::zap_labels(CavOral_si_no)) %>%
+  filter(CavOral_si_no == 0)
+
+deg_resp_noOC <- run_deg_volcano(
+  data               = db_resp_noOC,
+  subset_label       = "Responders_vs_NonResponders_NoOralCavity",
+  subset_description = "Non-oral cavity HNSCC",
+  group_var          = "responder_group",
+  group_levels       = c("Non_Responder", "Responder"),
+  group_labels       = c("Non-Responder (SD+PD)", "Responder (CR+PR)"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_responders_siOC}
+# Oral cavity — Responedors vs No Responedors
+db_resp_siOC <- db_responders %>%
+  mutate(CavOral_si_no = haven::zap_labels(CavOral_si_no)) %>%
+  filter(CavOral_si_no == 1)
+
+deg_resp_siOC <- run_deg_volcano(
+  data               = db_resp_siOC,
+  subset_label       = "Responders_vs_NonResponders_OralCavity",
+  subset_description = "Oral cavity HNSCC",
+  group_var          = "responder_group",
+  group_levels       = c("Non_Responder", "Responder"),
+  group_labels       = c("Non-Responder (SD+PD)", "Responder (CR+PR)"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_responders_pSTAT3low}
+# pSTAT3-low — Responedors vs No Responedors
+db_resp_pstat3 <- db_responders %>%
+  mutate(
+    pSTAT3_group = cut(
+      haven::zap_labels(pSTAT3_Histoscore),
+      breaks = c(-Inf, 29, 73, Inf),
+      labels = c("low", "intermediate", "high"),
+      right  = TRUE
+    )
+  )
+
+db_resp_plow <- db_resp_pstat3 %>% filter(pSTAT3_group == "low")
+
+deg_resp_plow <- run_deg_volcano(
+  data               = db_resp_plow,
+  subset_label       = "Responders_vs_NonResponders_pSTAT3low",
+  subset_description = "pSTAT3-low patients",
+  group_var          = "responder_group",
+  group_levels       = c("Non_Responder", "Responder"),
+  group_labels       = c("Non-Responder (SD+PD)", "Responder (CR+PR)"),
+  output_dir         = output_dir
+)
+```
+
+```{r volcano_responders_pSTAT3high}
+# pSTAT3-high — Responedors vs No Responedors
+db_resp_phigh <- db_resp_pstat3 %>% filter(pSTAT3_group == "high")
+
+deg_resp_phigh <- run_deg_volcano(
+  data               = db_resp_phigh,
+  subset_label       = "Responders_vs_NonResponders_pSTAT3high",
+  subset_description = "pSTAT3-high patients",
+  group_var          = "responder_group",
+  group_levels       = c("Non_Responder", "Responder"),
+  group_labels       = c("Non-Responder (SD+PD)", "Responder (CR+PR)"),
+  output_dir         = output_dir
+)
+```
+
+```{r panel_grid1_volcanos}
+library(magick)
+
+base_path <- "C:/Users/socla/Documents/results/07_Results_DEG_Limma/"
+
+imgs <- image_read(c(
+  paste0(base_path, "Volcano_Benefit_vs_NoBenefit.png"),
+  paste0(base_path, "Volcano_DCR_vs_PE.png"),
+  paste0(base_path, "Volcano_Responders_vs_NonResponders_All.png"),
+  paste0(base_path, "Volcano_RC_vs_PE.png")
+))
+
+panel <- image_montage(
+  imgs,
+  geometry = "x500+8+8",
+  tile = "2x2",
+  bg = "white"
+)
+
+image_write(panel, 
+            path = paste0(base_path, "volcano_panel_grid1.png"),
+            format = "png")
+```
+
+```{r panel_grid2_volcanos}
+library(magick)
+
+base_path <- "C:/Users/socla/Documents/results/07_Results_DEG_Limma/"
+
+imgs <- image_read(c(
+  paste0(base_path, "Volcano_pSTAT3_High_vs_Low.png"),
+  paste0(base_path, "Volcano_pSTAT3_High_vs_Low_PDL1pos.png"),
+  paste0(base_path, "Volcano_pSTAT3_High_vs_Low_No_OralCavity.png")
+))
+
+panel <- image_montage(
+  imgs,
+  geometry = "x500+8+8",
+  tile = "3x1",
+  bg = "white"
+)
+
+image_write(panel, 
+            path = paste0(base_path, "volcano_panel_grid2.png"),
+            format = "png")
+```
+
+```{r panel_grid3_volcanos}
+library(magick)
+
+base_path <- "C:/Users/socla/Documents/results/07_Results_DEG_Limma/"
+
+imgs <- image_read(c(
+  paste0(base_path, "Volcano_pSTAT3high_Benefit_vs_NoBenefit.png"),
+  paste0(base_path, "Volcano_RC_vs_PE_pSTAT3high.png")
+))
+
+panel <- image_montage(
+  imgs,
+  geometry = "x500+8+8",
+  tile = "2x1",
+  bg = "white"
+)
+
+image_write(panel, 
+            path = paste0(base_path, "volcano_panel_grid3.png"),
+            format = "png")
+```
+
+```{r volcanos PDL1 posVSneg}
+# PDL1: 1 = positiu, 0 = negatiu, 2 = unknown (els unknown s'exclouen perquè no estan a group_levels)
+# Subsets pSTAT3 per als comparadors 2 i 3
+db_pdl1_pstat3 <- db_completa_log2 %>%
+  mutate(
+    pSTAT3_group = cut(
+      haven::zap_labels(pSTAT3_Histoscore),
+      breaks = c(-Inf, 29, 73, Inf),
+      labels = c("low", "intermediate", "high"),
+      right  = TRUE
+    )
+  )
+
+db_pdl1_pstat3_low  <- db_pdl1_pstat3 %>% filter(pSTAT3_group == "low")
+db_pdl1_pstat3_high <- db_pdl1_pstat3 %>% filter(pSTAT3_group == "high")
+
+
+# All patients — PDL1+ vs PDL1-
+deg_pdl1_all <- run_deg_volcano(
+  data               = db_completa_log2,
+  subset_label       = "PDL1pos_vs_neg_All",
+  subset_description = "All patients",
+  group_var          = "PDL1",
+  group_levels       = c(0, 1),
+  group_labels       = c("PDL1_negative", "PDL1_positive"),
+  output_dir         = output_dir
+)
+
+
+
+# pSTAT3-high — PDL1+ vs PDL1-
+deg_pdl1_phigh <- run_deg_volcano(
+  data               = db_pdl1_pstat3_high,
+  subset_label       = "PDL1pos_vs_neg_pSTAT3high",
+  subset_description = "pSTAT3-high patients",
+  group_var          = "PDL1",
+  group_levels       = c(0, 1),
+  group_labels       = c("PDL1_negative", "PDL1_positive"),
+  output_dir         = output_dir
+)
+
+
+# pSTAT3-low — PDL1+ vs PDL1-
+deg_pdl1_plow <- run_deg_volcano(
+  data               = db_pdl1_pstat3_low,
+  subset_label       = "PDL1pos_vs_neg_pSTAT3low",
+  subset_description = "pSTAT3-low patients",
+  group_var          = "PDL1",
+  group_levels       = c(0, 1),
+  group_labels       = c("PDL1_negative", "PDL1_positive"),
+  output_dir         = output_dir
+)
+
+
+# Non-oral cavity — PDL1+ vs PDL1-
+db_pdl1_noOC <- db_completa_log2 %>%
+  mutate(CavOral_si_no = haven::zap_labels(CavOral_si_no)) %>%
+  filter(CavOral_si_no == 0)
+
+deg_pdl1_noOC <- run_deg_volcano(
+  data               = db_pdl1_noOC,
+  subset_label       = "PDL1pos_vs_neg_NoOralCavity",
+  subset_description = "Non-oral cavity HNSCC",
+  group_var          = "PDL1",
+  group_levels       = c(0, 1),
+  group_labels       = c("PDL1_negative", "PDL1_positive"),
+  output_dir         = output_dir
+)
+
+
+# Oral cavity — PDL1+ vs PDL1-
+db_pdl1_siOC <- db_completa_log2 %>%
+  mutate(CavOral_si_no = haven::zap_labels(CavOral_si_no)) %>%
+  filter(CavOral_si_no == 1)
+
+deg_pdl1_siOC <- run_deg_volcano(
+  data               = db_pdl1_siOC,
+  subset_label       = "PDL1pos_vs_neg_OralCavity",
+  subset_description = "Oral cavity HNSCC",
+  group_var          = "PDL1",
+  group_levels       = c(0, 1),
+  group_labels       = c("PDL1_negative", "PDL1_positive"),
+  output_dir         = output_dir
+)
+```
+
+
+
+
+
+
+
+
+# ------ BOXPLOTS -------
+```{r boxplots_responders_6gens}
+library(cowplot)
+
+genes_of_interest <- c("WNT10A", "IL24", "PRKX", "TWIST2", "STAT3", "CD274")
+
+db_boxplot <- db_responders %>%
+  mutate(
+    responder_group = factor(responder_group,
+                             levels = c("Non_Responder", "Responder"),
+                             labels = c("Non-Responder", "Responder"))
+  ) %>%
+  filter(!is.na(responder_group)) %>%
+  dplyr::select(Codi_Noray, responder_group, starts_with("Endogenous_")) %>%
+  pivot_longer(
+    cols      = starts_with("Endogenous_"),
+    names_to  = "gene_raw",
+    values_to = "expression"
+  ) %>%
+  mutate(
+    gene_clean      = gene_raw %>%
+      str_extract("(?<=Endogenous_).*") %>%
+      str_remove("_[NX][MR]_\\d+\\.?\\d*$"),
+    # Re-factoritzar explícitament després del pivot
+    responder_group = factor(responder_group,
+                             levels = c("Non-Responder", "Responder"))
+  ) %>%
+  filter(gene_clean %in% genes_of_interest)
+
+group_colors <- c("Non-Responder" = "maroon",
+                  "Responder"     = "cornflowerblue")
+
+group_labels_display <- c("Non-Responder" = "Non-Responder\n(SD+PD)",
+                          "Responder"     = "Responder\n(CR+PR)")
+
+plot_boxplot_gene <- function(gene_name, data, colors, labels_display, output_dir) {
+  
+  df <- data %>%
+    filter(gene_clean == gene_name) %>%
+    mutate(responder_group = factor(responder_group,
+                                    levels = c("Non-Responder", "Responder")))
+  
+  wt      <- wilcox.test(expression ~ responder_group, data = df, exact = FALSE)
+  p_label <- ifelse(wt$p.value < 0.05,
+                    paste0("p = ", formatC(wt$p.value, format = "f", digits = 3), " *"),
+                    paste0("p = ", formatC(wt$p.value, format = "f", digits = 3)))
+  
+  y_max   <- max(df$expression, na.rm = TRUE)
+  y_min   <- min(df$expression, na.rm = TRUE)
+  y_range <- y_max - y_min
+  y_annot <- y_max + y_range * 0.12
+  
+  p <- ggplot(df, aes(x = responder_group, y = expression, fill = responder_group)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.75, width = 0.45,
+                 color = "grey30", linewidth = 0.5) +
+    geom_jitter(aes(color = responder_group), width = 0.12, size = 2.2,
+                alpha = 0.85, show.legend = FALSE) +
+    annotate("segment",
+             x = 1, xend = 2,
+             y = y_annot, yend = y_annot,
+             color = "grey40", linewidth = 0.5) +
+    annotate("text",
+             x = 1.5, y = y_annot + y_range * 0.05,
+             label = p_label, size = 3.8, color = "grey20") +
+    scale_fill_manual(values  = colors) +
+    scale_color_manual(values = colors) +
+    scale_x_discrete(labels  = labels_display) +
+    coord_cartesian(ylim = c(y_min - y_range * 0.05,
+                             y_annot + y_range * 0.15)) +
+    labs(title = gene_name, x = NULL, y = "log2 Expression") +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title      = element_text(face = "bold", hjust = 0.5, size = 13),
+      legend.position = "none",
+      axis.text.x     = element_text(size = 10, color = "grey20"),
+      axis.text.y     = element_text(size = 10),
+      axis.title.y    = element_text(size = 10)
+    )
+  
+  ggsave(
+    filename = file.path(output_dir, paste0("Boxplot_Responders_", gene_name, ".png")),
+    plot     = p, width = 3.5, height = 4.5, dpi = 300
+  )
+  
+  return(p)
+}
+
+plots_list <- lapply(genes_of_interest, plot_boxplot_gene,
+                     data           = db_boxplot,
+                     colors         = group_colors,
+                     labels_display = group_labels_display,
+                     output_dir     = output_dir)
+names(plots_list) <- genes_of_interest
+
+panel <- cowplot::plot_grid(plotlist = plots_list, ncol = 3, nrow = 2, align = "hv")
+
+panel_title <- cowplot::ggdraw() +
+  cowplot::draw_label("Responder (CR+PR) vs Non-Responder (SD+PD)",
+                      fontface = "bold", size = 13, x = 0.5, hjust = 0.5)
+
+panel_final <- cowplot::plot_grid(panel_title, panel,
+                                  ncol = 1, rel_heights = c(0.06, 1))
+print(panel_final)
+
+ggsave(
+  filename = file.path(output_dir, "Boxplots_Responders_6genes_panel.png"),
+  plot     = panel_final, width = 11, height = 9, dpi = 300
+)
+```
+
+```{r boxplots_PDvsResponders_6gens}
+library(cowplot)
+
+genes_of_interest <- c("WNT10A", "IL24", "PRKX", "TWIST2", "STAT3", "CD274")
+
+db_boxplot_PD <- db_responders %>%
+  filter(Mejor_respuesta_a_IT %in% c(0, 1, 3)) %>%
+  mutate(
+    pd_group = case_when(
+      Mejor_respuesta_a_IT == 3          ~ "PD",
+      Mejor_respuesta_a_IT %in% c(0, 1) ~ "Responder"
+    ),
+    pd_group = factor(pd_group, levels = c("PD", "Responder"))
+  ) %>%
+  dplyr::select(Codi_Noray, pd_group, starts_with("Endogenous_")) %>%
+  pivot_longer(
+    cols      = starts_with("Endogenous_"),
+    names_to  = "gene_raw",
+    values_to = "expression"
+  ) %>%
+  mutate(
+    gene_clean = gene_raw %>%
+      str_extract("(?<=Endogenous_).*") %>%
+      str_remove("_[NX][MR]_\\d+\\.?\\d*$"),
+    pd_group   = factor(pd_group, levels = c("PD", "Responder"))
+  ) %>%
+  filter(gene_clean %in% genes_of_interest)
+
+group_colors_PD <- c("PD"        = "maroon",
+                     "Responder" = "cornflowerblue")
+
+group_labels_PD <- c("PD"        = "Non-Responder\n(PD)",
+                     "Responder" = "Responder\n(CR+PR)")
+
+plot_boxplot_gene_PD <- function(gene_name, data, colors, labels_display, output_dir) {
+  
+  df <- data %>%
+    filter(gene_clean == gene_name) %>%
+    mutate(pd_group = droplevels(factor(pd_group, levels = c("PD", "Responder"))))
+  
+  wt      <- wilcox.test(expression ~ pd_group, data = df, exact = FALSE)
+  p_label <- ifelse(wt$p.value < 0.05,
+                    paste0("p = ", formatC(wt$p.value, format = "f", digits = 3), " *"),
+                    paste0("p = ", formatC(wt$p.value, format = "f", digits = 3)))
+  
+  y_max   <- max(df$expression, na.rm = TRUE)
+  y_min   <- min(df$expression, na.rm = TRUE)
+  y_range <- y_max - y_min
+  y_annot <- y_max + y_range * 0.12
+  
+  p <- ggplot(df, aes(x = pd_group, y = expression, fill = pd_group)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.75, width = 0.45,
+                 color = "grey30", linewidth = 0.5) +
+    geom_jitter(aes(color = pd_group), width = 0.12, size = 2.2,
+                alpha = 0.85, show.legend = FALSE) +
+    annotate("segment",
+             x = 1, xend = 2,
+             y = y_annot, yend = y_annot,
+             color = "grey40", linewidth = 0.5) +
+    annotate("text",
+             x = 1.5, y = y_annot + y_range * 0.05,
+             label = p_label, size = 3.8, color = "grey20") +
+    scale_fill_manual(values  = colors) +
+    scale_color_manual(values = colors) +
+    scale_x_discrete(labels  = labels_display) +
+    coord_cartesian(ylim = c(y_min - y_range * 0.05,
+                             y_annot + y_range * 0.15)) +
+    labs(title = gene_name, x = NULL, y = "log2 Expression") +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title      = element_text(face = "bold", hjust = 0.5, size = 13),
+      legend.position = "none",
+      axis.text.x     = element_text(size = 10, color = "grey20"),
+      axis.text.y     = element_text(size = 10),
+      axis.title.y    = element_text(size = 10)
+    )
+  
+  ggsave(
+    filename = file.path(output_dir, paste0("Boxplot_PD_vs_CRPR_", gene_name, ".png")),
+    plot     = p, width = 3.5, height = 4.5, dpi = 300
+  )
+  
+  return(p)
+}
+
+plots_list_PD <- lapply(genes_of_interest, plot_boxplot_gene_PD,
+                        data           = db_boxplot_PD,
+                        colors         = group_colors_PD,
+                        labels_display = group_labels_PD,
+                        output_dir     = output_dir)
+names(plots_list_PD) <- genes_of_interest
+
+panel_PD <- cowplot::plot_grid(plotlist = plots_list_PD, ncol = 3, nrow = 2, align = "hv")
+
+panel_title_PD <- cowplot::ggdraw() +
+  cowplot::draw_label("Responder (CR+PR) vs Non-Responder (PD only)",
+                      fontface = "bold", size = 13, x = 0.5, hjust = 0.5)
+
+panel_final_PD <- cowplot::plot_grid(panel_title_PD, panel_PD,
+                                     ncol = 1, rel_heights = c(0.06, 1))
+print(panel_final_PD)
+
+ggsave(
+  filename = file.path(output_dir, "Boxplots_PD_vs_CRPR_6genes_panel.png"),
+  plot     = panel_final_PD, width = 11, height = 9, dpi = 300
+)
+```
+
+
+```{r boxplots_CRvsPD_6gens}
+library(cowplot)
+
+genes_of_interest <- c("WNT10A", "IL24", "PRKX", "TWIST2", "STAT3", "CD274")
+
+db_boxplot_PD <- db_responders %>%
+  filter(Mejor_respuesta_a_IT %in% c(0, 3)) %>%
+  mutate(
+    pd_group = case_when(
+      Mejor_respuesta_a_IT == 3          ~ "PD",
+      Mejor_respuesta_a_IT == 0 ~ "CR"
+    ),
+    pd_group = factor(pd_group, levels = c("PD", "CR"))
+  ) %>%
+  dplyr::select(Codi_Noray, pd_group, starts_with("Endogenous_")) %>%
+  pivot_longer(
+    cols      = starts_with("Endogenous_"),
+    names_to  = "gene_raw",
+    values_to = "expression"
+  ) %>%
+  mutate(
+    gene_clean = gene_raw %>%
+      str_extract("(?<=Endogenous_).*") %>%
+      str_remove("_[NX][MR]_\\d+\\.?\\d*$"),
+    pd_group   = factor(pd_group, levels = c("PD", "CR"))
+  ) %>%
+  filter(gene_clean %in% genes_of_interest)
+
+group_colors_PD <- c("PD"        = "maroon",
+                     "CR" = "cornflowerblue")
+
+group_labels_PD <- c("PD"        = "PD",
+                     "CR" = "CR")
+
+plot_boxplot_gene_PD <- function(gene_name, data, colors, labels_display, output_dir) {
+  
+  df <- data %>%
+    filter(gene_clean == gene_name) %>%
+    mutate(pd_group = droplevels(factor(pd_group, levels = c("PD", "CR"))))
+  
+  wt      <- wilcox.test(expression ~ pd_group, data = df, exact = FALSE)
+  p_label <- ifelse(wt$p.value < 0.05,
+                    paste0("p = ", formatC(wt$p.value, format = "f", digits = 3), " *"),
+                    paste0("p = ", formatC(wt$p.value, format = "f", digits = 3)))
+  
+  y_max   <- max(df$expression, na.rm = TRUE)
+  y_min   <- min(df$expression, na.rm = TRUE)
+  y_range <- y_max - y_min
+  y_annot <- y_max + y_range * 0.12
+  
+  p <- ggplot(df, aes(x = pd_group, y = expression, fill = pd_group)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.75, width = 0.45,
+                 color = "grey30", linewidth = 0.5) +
+    geom_jitter(aes(color = pd_group), width = 0.12, size = 2.2,
+                alpha = 0.85, show.legend = FALSE) +
+    annotate("segment",
+             x = 1, xend = 2,
+             y = y_annot, yend = y_annot,
+             color = "grey40", linewidth = 0.5) +
+    annotate("text",
+             x = 1.5, y = y_annot + y_range * 0.05,
+             label = p_label, size = 3.8, color = "grey20") +
+    scale_fill_manual(values  = colors) +
+    scale_color_manual(values = colors) +
+    scale_x_discrete(labels  = labels_display) +
+    coord_cartesian(ylim = c(y_min - y_range * 0.05,
+                             y_annot + y_range * 0.15)) +
+    labs(title = gene_name, x = NULL, y = "log2 Expression") +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title      = element_text(face = "bold", hjust = 0.5, size = 13),
+      legend.position = "none",
+      axis.text.x     = element_text(size = 10, color = "grey20"),
+      axis.text.y     = element_text(size = 10),
+      axis.title.y    = element_text(size = 10)
+    )
+  
+  ggsave(
+    filename = file.path(output_dir, paste0("Boxplot_PD_vs_CR_", gene_name, ".png")),
+    plot     = p, width = 3.5, height = 4.5, dpi = 300
+  )
+  
+  return(p)
+}
+
+plots_list_PD <- lapply(genes_of_interest, plot_boxplot_gene_PD,
+                        data           = db_boxplot_PD,
+                        colors         = group_colors_PD,
+                        labels_display = group_labels_PD,
+                        output_dir     = output_dir)
+names(plots_list_PD) <- genes_of_interest
+
+panel_PD <- cowplot::plot_grid(plotlist = plots_list_PD, ncol = 3, nrow = 2, align = "hv")
+
+panel_title_PD <- cowplot::ggdraw() +
+  cowplot::draw_label("Complete Response vs Disease Progression",
+                      fontface = "bold", size = 13, x = 0.5, hjust = 0.5)
+
+panel_final_PD <- cowplot::plot_grid(panel_title_PD, panel_PD,
+                                     ncol = 1, rel_heights = c(0.06, 1))
+print(panel_final_PD)
+
+ggsave(
+  filename = file.path(output_dir, "Boxplots_PD_vs_CR_6genes_panel.png"),
+  plot     = panel_final_PD, width = 11, height = 9, dpi = 300
+)
+```
+
+```{r boxplots_4groups_6gens}
+library(cowplot)
+
+genes_of_interest <- c("WNT10A", "IL24", "PRKX", "TWIST2", "STAT3", "CD274")
+
+response_levels <- c("CR", "PR", "SD", "PD")
+
+group_colors <- c(
+  "CR" = "hotpink2",
+  "PR" = "gold1",
+  "SD" = "blue",
+  "PD" = "steelblue3"
+)
+
+group_labels_display <- c(
+  "CR" = "CR\n(Complete\nResponse)",
+  "PR" = "PR\n(Partial\nResponse)",
+  "SD" = "SD\n(Stable\nDisease)",
+  "PD" = "PD\n(Progressive\nDisease)"
+)
+
+db_boxplot <- db_completa_log2 %>%
+  mutate(
+    response_group = factor(
+      recode(as.character(zap_labels(Mejor_respuesta_a_IT)),
+             "0" = "CR",
+             "1" = "PR",
+             "2" = "SD",
+             "3" = "PD"),
+      levels = response_levels
+    )
+  ) %>%
+  filter(!is.na(response_group)) %>%
+  dplyr::select(Codi_Noray, response_group, starts_with("Endogenous_")) %>%
+  pivot_longer(
+    cols      = starts_with("Endogenous_"),
+    names_to  = "gene_raw",
+    values_to = "expression"
+  ) %>%
+  mutate(
+    gene_clean = gene_raw %>%
+      str_extract("(?<=Endogenous_).*") %>%
+      str_remove("_[NX][MR]_\\d+\\.?\\d*$")
+  ) %>%
+  filter(gene_clean %in% genes_of_interest)
+
+plot_boxplot_gene_4grp <- function(gene_name, data, colors, labels_display, output_dir) {
+  
+  df <- data %>%
+    filter(gene_clean == gene_name) %>%
+    mutate(response_group = factor(response_group, levels = names(colors)))
+  
+  # Guarda: mínim 2 grups amb dades
+  n_groups <- df %>%
+    filter(!is.na(response_group)) %>%
+    pull(response_group) %>%
+    droplevels() %>%
+    nlevels()
+  
+  if (n_groups < 2) {
+    message("Skipping ", gene_name, ": fewer than 2 groups with data")
+    return(NULL)
+  }
+  
+  # Kruskal-Wallis global
+  kw       <- kruskal.test(expression ~ response_group, data = df)
+  kw_label <- ifelse(
+    kw$p.value < 0.05,
+    paste0("Kruskal-Wallis p = ", formatC(kw$p.value, format = "f", digits = 3), " *"),
+    paste0("Kruskal-Wallis p = ", formatC(kw$p.value, format = "f", digits = 3))
+  )
+  
+  y_max   <- max(df$expression, na.rm = TRUE)
+  y_min   <- min(df$expression, na.rm = TRUE)
+  y_range <- y_max - y_min
+  y_annot <- y_max + y_range * 0.10
+  
+  p <- ggplot(df, aes(x = response_group, y = expression, fill = response_group)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.75, width = 0.5,
+                 color = "grey30", linewidth = 0.5) +
+    geom_jitter(aes(color = response_group), width = 0.12, size = 2.0,
+                alpha = 0.85, show.legend = FALSE) +
+    annotate("text",
+             x = 2.5, y = y_annot + y_range * 0.05,
+             label = kw_label, size = 3.2, color = "grey20") +
+    scale_fill_manual(values  = colors) +
+    scale_color_manual(values = colors) +
+    scale_x_discrete(labels  = labels_display) +
+    coord_cartesian(ylim = c(y_min - y_range * 0.05,
+                             y_annot + y_range * 0.20)) +
+    labs(title = gene_name, x = NULL, y = "log2 Expression") +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title      = element_text(face = "bold", hjust = 0.5, size = 13),
+      legend.position = "none",
+      axis.text.x     = element_text(size = 9, color = "grey20"),
+      axis.text.y     = element_text(size = 10),
+      axis.title.y    = element_text(size = 10)
+    )
+  
+  ggsave(
+    filename = file.path(output_dir, paste0("Boxplot_4groups_", gene_name, ".png")),
+    plot     = p, width = 4.0, height = 4.5, dpi = 300
+  )
+  
+  return(p)
+}
+
+plots_list <- lapply(genes_of_interest, plot_boxplot_gene_4grp,
+                     data           = db_boxplot,
+                     colors         = group_colors,
+                     labels_display = group_labels_display,
+                     output_dir     = output_dir)
+names(plots_list) <- genes_of_interest
+
+# Elimina nulls per si algun gen ha fallat la guarda
+plots_list <- Filter(Negate(is.null), plots_list)
+
+panel <- cowplot::plot_grid(plotlist = plots_list, ncol = 3, nrow = 2, align = "hv")
+
+panel_title <- cowplot::ggdraw() +
+  cowplot::draw_label("Gene Expression by RECIST Response Category",
+                      fontface = "bold", size = 13, x = 0.5, hjust = 0.5)
+
+panel_final <- cowplot::plot_grid(panel_title, panel,
+                                  ncol = 1, rel_heights = c(0.05, 1))
+print(panel_final)
+
+ggsave(
+  filename = file.path(output_dir, "Boxplots_4groups_6genes_panel.png"),
+  plot     = panel_final, width = 13, height = 9, dpi = 300
+)
+```
+
+
+```{r PDL1_MAGEA4_boxpltos}
+# ============================================================
+# BOXPLOTS: PD-L1 expression (Benefit vs No Benefit)
+#           MAGEA4 expression (4 comparisons)
+# ============================================================
+
+library(cowplot)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(haven)
+
+# ── 0. Funció genèrica de boxplot 2 grups ────────────────────
+
+plot_boxplot_2grp <- function(gene_name, data_long,
+                               grp_var, grp_levels, grp_labels,
+                               grp_colors, subtitle = NULL,
+                               output_dir) {
+
+  df <- data_long %>%
+    filter(gene_clean == gene_name) %>%
+    mutate(grp = factor(.data[[grp_var]], levels = grp_levels))
+
+  n_groups <- df %>%
+    filter(!is.na(grp)) %>%
+    pull(grp) %>%
+    droplevels() %>%
+    nlevels()
+
+  if (n_groups < 2) {
+    message("Skipping ", gene_name, " [", grp_var, "]: fewer than 2 groups")
+    return(NULL)
+  }
+
+  wt        <- wilcox.test(expression ~ grp, data = df, exact = FALSE)
+  wt_label  <- ifelse(
+    wt$p.value < 0.05,
+    paste0("Wilcoxon p = ", formatC(wt$p.value, format = "f", digits = 3), " *"),
+    paste0("Wilcoxon p = ", formatC(wt$p.value, format = "f", digits = 3))
+  )
+
+  y_max   <- max(df$expression, na.rm = TRUE)
+  y_min   <- min(df$expression, na.rm = TRUE)
+  y_range <- y_max - y_min
+  y_annot <- y_max + y_range * 0.10
+
+  p <- ggplot(df, aes(x = grp, y = expression, fill = grp)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.75, width = 0.45,
+                 color = "grey30", linewidth = 0.5) +
+    geom_jitter(aes(color = grp), width = 0.10, size = 2.2,
+                alpha = 0.85, show.legend = FALSE) +
+    annotate("text",
+             x = 1.5, y = y_annot + y_range * 0.05,
+             label = wt_label, size = 3.2, color = "grey20") +
+    scale_fill_manual(values  = grp_colors) +
+    scale_color_manual(values = grp_colors) +
+    scale_x_discrete(labels  = grp_labels) +
+    coord_cartesian(ylim = c(y_min - y_range * 0.05,
+                             y_annot + y_range * 0.22)) +
+    labs(
+      title    = gene_name,
+      subtitle = subtitle,
+      x        = NULL,
+      y        = "log2 Expression"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title      = element_text(face = "bold", hjust = 0.5, size = 13),
+      plot.subtitle   = element_text(hjust = 0.5, size = 10, color = "grey40"),
+      legend.position = "none",
+      axis.text.x     = element_text(size = 10, color = "grey20"),
+      axis.text.y     = element_text(size = 10),
+      axis.title.y    = element_text(size = 10)
+    )
+
+  fname <- paste0("Boxplot_", gene_name, "_", grp_var, ".png")
+  ggsave(
+    filename = file.path(output_dir, fname),
+    plot     = p, width = 3.8, height = 4.5, dpi = 300
+  )
+
+  return(p)
+}
+
+# ── 1. Preparació: taula llarga amb PD-L1 i MAGEA4 ──────────
+
+genes_target <- c("CD274", "MAGEA4")   # CD274 = PD-L1
+
+db_long <- db_completa_log2 %>%
+  mutate(
+    # Clinical benefit: 0 = CR/PR/SD → Benefit, 1 = PD → No Benefit
+    # Canvia NOMÉS aquest bloc dins del mutate() de db_long:
+
+benefit = factor(
+  case_when(
+    zap_labels(clinical_benefit) == 1 ~ "Benefit",
+    zap_labels(clinical_benefit) == 0 ~ "No Benefit",
+    TRUE ~ NA_character_
+  ),
+  levels = c("Benefit", "No Benefit")
+),
+    # Responders (CR/PR) vs Non-Responders (SD/PD)
+    responder = factor(
+      case_when(
+        zap_labels(Mejor_respuesta_a_IT) %in% c(0, 1) ~ "Responder",
+        zap_labels(Mejor_respuesta_a_IT) %in% c(2, 3) ~ "Non-Responder",
+        TRUE ~ NA_character_
+      ),
+      levels = c("Responder", "Non-Responder")
+    ),
+    # Disease Control (CR/PR/SD) vs Progressive Evaluation (PD)
+    dcr_pe = factor(
+      case_when(
+        zap_labels(Mejor_respuesta_a_IT) %in% c(0, 1, 2) ~ "DCR",
+        zap_labels(Mejor_respuesta_a_IT) == 3              ~ "PE",
+        TRUE ~ NA_character_
+      ),
+      levels = c("DCR", "PE")
+    ),
+    # CR vs PD (excloem SD i PR)
+    cr_vs_pd = factor(
+      case_when(
+        zap_labels(Mejor_respuesta_a_IT) == 0 ~ "CR",
+        zap_labels(Mejor_respuesta_a_IT) == 3 ~ "PD",
+        TRUE ~ NA_character_
+      ),
+      levels = c("CR", "PD")
+    )
+  ) %>%
+  dplyr::select(Codi_Noray,
+                benefit, responder, dcr_pe, cr_vs_pd,
+                starts_with("Endogenous_")) %>%
+  pivot_longer(
+    cols      = starts_with("Endogenous_"),
+    names_to  = "gene_raw",
+    values_to = "expression"
+  ) %>%
+  mutate(
+    gene_clean = gene_raw %>%
+      str_extract("(?<=Endogenous_).*") %>%
+      str_remove("_[NX][MR]_\\d+\\.?\\d*$")
+  ) %>%
+  filter(gene_clean %in% genes_target)
+
+# ── 2. PD-L1 (CD274): Benefit vs No Benefit ─────────────────
+
+p_pdl1_benefit <- plot_boxplot_2grp(
+  gene_name  = "CD274",
+  data_long  = db_long,
+  grp_var    = "benefit",
+  grp_levels = c("Benefit", "No Benefit"),
+  grp_labels = c("Benefit\n(CR/PR/SD)", "No Benefit\n(PD)"),
+  grp_colors = annotation_colors_full$Clinical_Benefit,
+  subtitle   = "PD-L1 (CD274)",
+  output_dir = output_dir
+)
+
+# ── 3. MAGEA4: 4 comparacions ────────────────────────────────
+
+comparisons_magea4 <- list(
+  list(
+    grp_var    = "benefit",
+    grp_levels = c("Benefit", "No Benefit"),
+    grp_labels = c("Benefit", "No Benefit"),
+    grp_colors = annotation_colors_full$Clinical_Benefit,
+    subtitle   = "Benefit vs No Benefit"
+  ),
+  list(
+    grp_var    = "responder",
+    grp_levels = c("Responder", "Non-Responder"),
+    grp_labels = c("Responder\n(CR/PR)", "Non-Responder\n(SD/PD)"),
+    grp_colors = c("Responder"     = annotation_colors_full$Resposta_Terapeutica[["Responder"]],
+                   "Non-Responder" = annotation_colors_full$Resposta_Terapeutica[["No Responder"]]),
+    subtitle   = "Responders vs Non-Responders"
+  ),
+  list(
+    grp_var    = "dcr_pe",
+    grp_levels = c("DCR", "PE"),
+    grp_labels = c("DCR\n(CR/PR/SD)", "PE\n(PD)"),
+    grp_colors = c("DCR" = annotation_colors_full$Resposta_Clinica[["EE"]],   # blau
+                   "PE"  = annotation_colors_full$Resposta_Clinica[["PE"]]),   # steelblue3
+    subtitle   = "Disease Control vs Progressive Evaluation"
+  ),
+  list(
+    grp_var    = "cr_vs_pd",
+    grp_levels = c("CR", "PD"),
+    grp_labels = c("CR\n(Complete\nResponse)", "PD\n(Progressive\nDisease)"),
+    grp_colors = c("CR" = annotation_colors_full$Resposta_Clinica[["RC"]],
+                   "PD" = annotation_colors_full$Resposta_Clinica[["PE"]]),
+    subtitle   = "CR vs PD"
+  )
+)
+
+plots_magea4 <- lapply(comparisons_magea4, function(comp) {
+  plot_boxplot_2grp(
+    gene_name  = "MAGEA4",
+    data_long  = db_long,
+    grp_var    = comp$grp_var,
+    grp_levels = comp$grp_levels,
+    grp_labels = comp$grp_labels,
+    grp_colors = comp$grp_colors,
+    subtitle   = comp$subtitle,
+    output_dir = output_dir
+  )
+})
+names(plots_magea4) <- sapply(comparisons_magea4, `[[`, "grp_var")
+plots_magea4 <- Filter(Negate(is.null), plots_magea4)
+
+# ── 4. Panels ────────────────────────────────────────────────
+
+# Panel PD-L1 (un sol plot, no cal grid)
+ggsave(
+  filename = file.path(output_dir, "Boxplot_PDL1_benefit.png"),
+  plot     = p_pdl1_benefit,
+  width = 3.8, height = 4.5, dpi = 300
+)
+
+# Panel MAGEA4 (2×2)
+panel_magea4 <- cowplot::plot_grid(
+  plotlist = plots_magea4,
+  ncol = 2, nrow = 2, align = "hv"
+)
+
+panel_title_magea4 <- cowplot::ggdraw() +
+  cowplot::draw_label(
+    "MAGEA4 Expression across Response Categories",
+    fontface = "bold", size = 13, x = 0.5, hjust = 0.5
+  )
+
+panel_final_magea4 <- cowplot::plot_grid(
+  panel_title_magea4, panel_magea4,
+  ncol = 1, rel_heights = c(0.05, 1)
+)
+
+print(p_pdl1_benefit)
+print(panel_final_magea4)
+
+ggsave(
+  filename = file.path(output_dir, "Boxplots_MAGEA4_4comparisons_panel.png"),
+  plot     = panel_final_magea4,
+  width = 9, height = 9, dpi = 300
+)
+```
+
+```{r boxplots_clinicalBenefit}
+library(cowplot)
+genes_of_interest <- c("WNT10A", "IL24", "PRKX", "TWIST2")
+db_boxplot_CB <- db_completa_log2 %>%
+  mutate(
+    cb_group = case_when(
+      clinical_benefit == 1 ~ "Clinical benefit",
+      clinical_benefit == 0 ~ "No clinical benefit"
+    ),
+    cb_group = factor(cb_group, levels = c("No clinical benefit", "Clinical benefit"))
+  ) %>%
+  filter(!is.na(cb_group)) %>%
+  dplyr::select(Codi_Noray, cb_group, starts_with("Endogenous_")) %>%
+  pivot_longer(
+    cols      = starts_with("Endogenous_"),
+    names_to  = "gene_raw",
+    values_to = "expression"
+  ) %>%
+  mutate(
+    gene_clean = gene_raw %>%
+      str_extract("(?<=Endogenous_).*") %>%
+      str_remove("_[NX][MR]_\\d+\\.?\\d*$"),
+    cb_group   = factor(cb_group, levels = c("No clinical benefit", "Clinical benefit"))
+  ) %>%
+  filter(gene_clean %in% genes_of_interest)
+group_colors_CB <- c("No clinical benefit" = "maroon",
+                     "Clinical benefit"    = "cornflowerblue")
+group_labels_CB <- c("No clinical benefit" = "No clinical benefit",
+                     "Clinical benefit"    = "Clinical benefit")
+plot_boxplot_gene_CB <- function(gene_name, data, colors, labels_display, output_dir) {
+  
+  df <- data %>%
+    filter(gene_clean == gene_name) %>%
+    mutate(cb_group = droplevels(factor(cb_group, levels = c("No clinical benefit", "Clinical benefit"))))
+  
+  wt      <- wilcox.test(expression ~ cb_group, data = df, exact = FALSE)
+  p_label <- ifelse(wt$p.value < 0.05,
+                    paste0("p = ", formatC(wt$p.value, format = "f", digits = 3), " *"),
+                    paste0("p = ", formatC(wt$p.value, format = "f", digits = 3)))
+  
+  y_max   <- max(df$expression, na.rm = TRUE)
+  y_min   <- min(df$expression, na.rm = TRUE)
+  y_range <- y_max - y_min
+  y_annot <- y_max + y_range * 0.12
+  
+  p <- ggplot(df, aes(x = cb_group, y = expression, fill = cb_group)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.75, width = 0.45,
+                 color = "grey30", linewidth = 0.5) +
+    geom_jitter(aes(color = cb_group), width = 0.12, size = 2.2,
+                alpha = 0.85, show.legend = FALSE) +
+    annotate("segment",
+             x = 1, xend = 2,
+             y = y_annot, yend = y_annot,
+             color = "grey40", linewidth = 0.5) +
+    annotate("text",
+             x = 1.5, y = y_annot + y_range * 0.05,
+             label = p_label, size = 3.8, color = "grey20") +
+    scale_fill_manual(values  = colors) +
+    scale_color_manual(values = colors) +
+    scale_x_discrete(labels  = labels_display) +
+    coord_cartesian(ylim = c(y_min - y_range * 0.05,
+                             y_annot + y_range * 0.15)) +
+    labs(title = gene_name, x = NULL, y = "log2 Expression") +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title      = element_text(face = "bold", hjust = 0.5, size = 13),
+      legend.position = "none",
+      axis.text.x     = element_text(size = 10, color = "grey20"),
+      axis.text.y     = element_text(size = 10),
+      axis.title.y    = element_text(size = 10)
+    )
+  
+  ggsave(
+    filename = file.path(output_dir, paste0("Boxplot_CB_", gene_name, ".png")),
+    plot     = p, width = 3.5, height = 4.5, dpi = 300
+  )
+  
+  return(p)
+}
+plots_list_CB <- lapply(genes_of_interest, plot_boxplot_gene_CB,
+                        data           = db_boxplot_CB,
+                        colors         = group_colors_CB,
+                        labels_display = group_labels_CB,
+                        output_dir     = output_dir)
+names(plots_list_CB) <- genes_of_interest
+panel_CB <- cowplot::plot_grid(plotlist = plots_list_CB, ncol = 2, nrow = 2, align = "hv")
+panel_title_CB <- cowplot::ggdraw() +
+  cowplot::draw_label("Clinical Benefit vs No Clinical Benefit",
+                      fontface = "bold", size = 13, x = 0.5, hjust = 0.5)
+panel_final_CB <- cowplot::plot_grid(panel_title_CB, panel_CB,
+                                     ncol = 1, rel_heights = c(0.06, 1))
+print(panel_final_CB)
+ggsave(
+  filename = file.path(output_dir, "Boxplots_CB_4genes_panel.png"),
+  plot     = panel_final_CB, width = 8, height = 9, dpi = 300
+)
+```
+
+```{r boxplots_DEGs_pSTAT3status}
+library(cowplot)
+genes_of_interest <- c("WNT10A", "IL24", "PRKX", "TWIST2")
+db_boxplot_pS <- db_completa_log2 %>%
+  mutate(
+    ps_group = cut(
+      haven::zap_labels(pSTAT3_Histoscore),
+      breaks = c(-Inf, 29, 73, Inf),
+      labels = c("pSTAT3 low", "pSTAT3 int", "pSTAT3 high"),
+      right  = TRUE
+    ),
+    ps_group = factor(ps_group, levels = c("pSTAT3 low", "pSTAT3 int", "pSTAT3 high"))
+  ) %>%
+  filter(!is.na(ps_group)) %>%
+  dplyr::select(Codi_Noray, ps_group, starts_with("Endogenous_")) %>%
+  pivot_longer(
+    cols      = starts_with("Endogenous_"),
+    names_to  = "gene_raw",
+    values_to = "expression"
+  ) %>%
+  mutate(
+    gene_clean = gene_raw %>%
+      str_extract("(?<=Endogenous_).*") %>%
+      str_remove("_[NX][MR]_\\d+\\.?\\d*$"),
+    ps_group   = factor(ps_group, levels = c("pSTAT3 low", "pSTAT3 int", "pSTAT3 high"))
+  ) %>%
+  filter(gene_clean %in% genes_of_interest)
+group_colors_pS <- c("pSTAT3 low"          = "cornflowerblue",
+                     "pSTAT3 int" = "goldenrod",
+                     "pSTAT3 high"         = "maroon")
+group_labels_pS <- c("pSTAT3 low"          = "pSTAT3 low",
+                     "pSTAT3 int" = "pSTAT3 int",
+                     "pSTAT3 high"         = "pSTAT3 high")
+plot_boxplot_gene_pS <- function(gene_name, data, colors, labels_display, output_dir) {
+  
+  df <- data %>%
+    filter(gene_clean == gene_name) %>%
+    mutate(ps_group = droplevels(factor(ps_group, levels = c("pSTAT3 low", "pSTAT3 int", "pSTAT3 high"))))
+  
+  kw      <- kruskal.test(expression ~ ps_group, data = df)
+  p_label <- ifelse(kw$p.value < 0.05,
+                    paste0("p = ", formatC(kw$p.value, format = "f", digits = 3), " *"),
+                    paste0("p = ", formatC(kw$p.value, format = "f", digits = 3)))
+  
+  y_max   <- max(df$expression, na.rm = TRUE)
+  y_min   <- min(df$expression, na.rm = TRUE)
+  y_range <- y_max - y_min
+  y_annot <- y_max + y_range * 0.12
+  
+  p <- ggplot(df, aes(x = ps_group, y = expression, fill = ps_group)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.75, width = 0.45,
+                 color = "grey30", linewidth = 0.5) +
+    geom_jitter(aes(color = ps_group), width = 0.12, size = 2.2,
+                alpha = 0.85, show.legend = FALSE) +
+    annotate("text",
+             x = 2, y = y_annot + y_range * 0.05,
+             label = p_label, size = 3.8, color = "grey20") +
+    scale_fill_manual(values  = colors) +
+    scale_color_manual(values = colors) +
+    scale_x_discrete(labels  = labels_display) +
+    coord_cartesian(ylim = c(y_min - y_range * 0.05,
+                             y_annot + y_range * 0.15)) +
+    labs(title = gene_name, x = NULL, y = "log2 Expression") +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title      = element_text(face = "bold", hjust = 0.5, size = 13),
+      legend.position = "none",
+      axis.text.x     = element_text(size = 9, color = "grey20", angle = 20, hjust = 1),
+      axis.text.y     = element_text(size = 10),
+      axis.title.y    = element_text(size = 10)
+    )
+  
+  ggsave(
+    filename = file.path(output_dir, paste0("Boxplot_pSTAT3_", gene_name, ".png")),
+    plot     = p, width = 3.5, height = 4.5, dpi = 300
+  )
+  
+  return(p)
+}
+plots_list_pS <- lapply(genes_of_interest, plot_boxplot_gene_pS,
+                        data           = db_boxplot_pS,
+                        colors         = group_colors_pS,
+                        labels_display = group_labels_pS,
+                        output_dir     = output_dir)
+names(plots_list_pS) <- genes_of_interest
+panel_pS <- cowplot::plot_grid(plotlist = plots_list_pS, ncol = 2, nrow = 2, align = "hv")
+panel_title_pS <- cowplot::ggdraw() +
+  cowplot::draw_label("Expression by pSTAT3 group",
+                      fontface = "bold", size = 13, x = 0.5, hjust = 0.5)
+panel_final_pS <- cowplot::plot_grid(panel_title_pS, panel_pS,
+                                     ncol = 1, rel_heights = c(0.06, 1))
+print(panel_final_pS)
+ggsave(
+  filename = file.path(output_dir, "Boxplots_pSTAT3_4genes_panel.png"),
+  plot     = panel_final_pS, width = 8, height = 9, dpi = 300
+)
+```
+
+```{r boxplots_DEGs_pSTAT3hs_clinicalbenefit}
+library(cowplot)
+genes_of_interest <- c("WNT10A", "IL24", "PRKX", "TWIST2")
+db_boxplot_pS_CB <- db_completa_log2 %>%
+  filter(clinical_benefit == 1) %>%
+  mutate(
+    ps_group = cut(
+      haven::zap_labels(pSTAT3_Histoscore),
+      breaks = c(-Inf, 29, 73, Inf),
+      labels = c("pSTAT3 low", "pSTAT3 int", "pSTAT3 high"),
+      right  = TRUE
+    ),
+    ps_group = factor(ps_group, levels = c("pSTAT3 low", "pSTAT3 int", "pSTAT3 high"))
+  ) %>%
+  filter(!is.na(ps_group)) %>%
+  dplyr::select(Codi_Noray, ps_group, starts_with("Endogenous_")) %>%
+  pivot_longer(
+    cols      = starts_with("Endogenous_"),
+    names_to  = "gene_raw",
+    values_to = "expression"
+  ) %>%
+  mutate(
+    gene_clean = gene_raw %>%
+      str_extract("(?<=Endogenous_).*") %>%
+      str_remove("_[NX][MR]_\\d+\\.?\\d*$"),
+    ps_group   = factor(ps_group, levels = c("pSTAT3 low", "pSTAT3 int", "pSTAT3 high"))
+  ) %>%
+  filter(gene_clean %in% genes_of_interest)
+group_colors_pS <- c("pSTAT3 low"          = "cornflowerblue",
+                     "pSTAT3 int" = "goldenrod",
+                     "pSTAT3 high"         = "maroon")
+group_labels_pS <- c("pSTAT3 low"          = "pSTAT3 low",
+                     "pSTAT3 int" = "pSTAT3 int",
+                     "pSTAT3 high"         = "pSTAT3 high")
+plot_boxplot_gene_pS <- function(gene_name, data, colors, labels_display, output_dir, file_prefix) {
+  
+  df <- data %>%
+    filter(gene_clean == gene_name) %>%
+    mutate(ps_group = droplevels(factor(ps_group, levels = c("pSTAT3 low", "pSTAT3 int", "pSTAT3 high"))))
+  
+  kw      <- kruskal.test(expression ~ ps_group, data = df)
+  p_label <- ifelse(kw$p.value < 0.05,
+                    paste0("p = ", formatC(kw$p.value, format = "f", digits = 3), " *"),
+                    paste0("p = ", formatC(kw$p.value, format = "f", digits = 3)))
+  
+  y_max   <- max(df$expression, na.rm = TRUE)
+  y_min   <- min(df$expression, na.rm = TRUE)
+  y_range <- y_max - y_min
+  y_annot <- y_max + y_range * 0.12
+  
+  p <- ggplot(df, aes(x = ps_group, y = expression, fill = ps_group)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.75, width = 0.45,
+                 color = "grey30", linewidth = 0.5) +
+    geom_jitter(aes(color = ps_group), width = 0.12, size = 2.2,
+                alpha = 0.85, show.legend = FALSE) +
+    annotate("text",
+             x = 2, y = y_annot + y_range * 0.05,
+             label = p_label, size = 3.8, color = "grey20") +
+    scale_fill_manual(values  = colors) +
+    scale_color_manual(values = colors) +
+    scale_x_discrete(labels  = labels_display) +
+    coord_cartesian(ylim = c(y_min - y_range * 0.05,
+                             y_annot + y_range * 0.15)) +
+    labs(title = gene_name, x = NULL, y = "log2 Expression") +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title      = element_text(face = "bold", hjust = 0.5, size = 13),
+      legend.position = "none",
+      axis.text.x     = element_text(size = 9, color = "grey20", angle = 20, hjust = 1),
+      axis.text.y     = element_text(size = 10),
+      axis.title.y    = element_text(size = 10)
+    )
+  
+  ggsave(
+    filename = file.path(output_dir, paste0(file_prefix, gene_name, ".png")),
+    plot     = p, width = 3.5, height = 4.5, dpi = 300
+  )
+  
+  return(p)
+}
+plots_list_pS_CB <- lapply(genes_of_interest, plot_boxplot_gene_pS,
+                           data           = db_boxplot_pS_CB,
+                           colors         = group_colors_pS,
+                           labels_display = group_labels_pS,
+                           output_dir     = output_dir,
+                           file_prefix    = "Boxplot_pSTAT3_CB_")
+names(plots_list_pS_CB) <- genes_of_interest
+panel_pS_CB <- cowplot::plot_grid(plotlist = plots_list_pS_CB, ncol = 2, nrow = 2, align = "hv")
+panel_title_pS_CB <- cowplot::ggdraw() +
+  cowplot::draw_label("Expression by pSTAT3 group — Clinical benefit",
+                      fontface = "bold", size = 13, x = 0.5, hjust = 0.5)
+panel_final_pS_CB <- cowplot::plot_grid(panel_title_pS_CB, panel_pS_CB,
+                                        ncol = 1, rel_heights = c(0.06, 1))
+print(panel_final_pS_CB)
+ggsave(
+  filename = file.path(output_dir, "Boxplots_pSTAT3_CB_4genes_panel.png"),
+  plot     = panel_final_pS_CB, width = 8, height = 9, dpi = 300
+)
+```
+
+```{r boxplots_DEGs_pSTAT3hs_noclinicalbenefit}
+db_boxplot_pS_NCB <- db_completa_log2 %>%
+  filter(clinical_benefit == 0) %>%
+  mutate(
+    ps_group = cut(
+      haven::zap_labels(pSTAT3_Histoscore),
+      breaks = c(-Inf, 29, 73, Inf),
+      labels = c("pSTAT3 low", "pSTAT3 int", "pSTAT3 high"),
+      right  = TRUE
+    ),
+    ps_group = factor(ps_group, levels = c("pSTAT3 low", "pSTAT3 int", "pSTAT3 high"))
+  ) %>%
+  filter(!is.na(ps_group)) %>%
+  dplyr::select(Codi_Noray, ps_group, starts_with("Endogenous_")) %>%
+  pivot_longer(
+    cols      = starts_with("Endogenous_"),
+    names_to  = "gene_raw",
+    values_to = "expression"
+  ) %>%
+  mutate(
+    gene_clean = gene_raw %>%
+      str_extract("(?<=Endogenous_).*") %>%
+      str_remove("_[NX][MR]_\\d+\\.?\\d*$"),
+    ps_group   = factor(ps_group, levels = c("pSTAT3 low", "pSTAT3 int", "pSTAT3 high"))
+  ) %>%
+  filter(gene_clean %in% genes_of_interest)
+plots_list_pS_NCB <- lapply(genes_of_interest, plot_boxplot_gene_pS,
+                            data           = db_boxplot_pS_NCB,
+                            colors         = group_colors_pS,
+                            labels_display = group_labels_pS,
+                            output_dir     = output_dir,
+                            file_prefix    = "Boxplot_pSTAT3_NCB_")
+names(plots_list_pS_NCB) <- genes_of_interest
+panel_pS_NCB <- cowplot::plot_grid(plotlist = plots_list_pS_NCB, ncol = 2, nrow = 2, align = "hv")
+panel_title_pS_NCB <- cowplot::ggdraw() +
+  cowplot::draw_label("Expression by pSTAT3 group — No clinical benefit",
+                      fontface = "bold", size = 13, x = 0.5, hjust = 0.5)
+panel_final_pS_NCB <- cowplot::plot_grid(panel_title_pS_NCB, panel_pS_NCB,
+                                         ncol = 1, rel_heights = c(0.06, 1))
+print(panel_final_pS_NCB)
+ggsave(
+  filename = file.path(output_dir, "Boxplots_pSTAT3_NCB_4genes_panel.png"),
+  plot     = panel_final_pS_NCB, width = 8, height = 9, dpi = 300
+)
+```
+
+```{r boxplots anna}
+library(cowplot)
+genes_of_interest <- c("WNT10A", "IL24", "PRKX", "TWIST2")
+db_boxplot_pS_CB_2g <- db_completa_log2 %>%
+  filter(clinical_benefit == 1) %>%
+  mutate(
+    ps_group = cut(
+      haven::zap_labels(pSTAT3_Histoscore),
+      breaks = c(-Inf, 73, Inf),
+      labels = c("pSTAT3 low/int", "pSTAT3 high"),
+      right  = TRUE
+    ),
+    ps_group = factor(ps_group, levels = c("pSTAT3 low/int", "pSTAT3 high"))
+  ) %>%
+  filter(!is.na(ps_group)) %>%
+  dplyr::select(Codi_Noray, ps_group, starts_with("Endogenous_")) %>%
+  pivot_longer(
+    cols      = starts_with("Endogenous_"),
+    names_to  = "gene_raw",
+    values_to = "expression"
+  ) %>%
+  mutate(
+    gene_clean = gene_raw %>%
+      str_extract("(?<=Endogenous_).*") %>%
+      str_remove("_[NX][MR]_\\d+\\.?\\d*$"),
+    ps_group   = factor(ps_group, levels = c("pSTAT3 low/int", "pSTAT3 high"))
+  ) %>%
+  filter(gene_clean %in% genes_of_interest)
+group_colors_pS_2g <- c("pSTAT3 low/int" = "cornflowerblue",
+                        "pSTAT3 high"    = "maroon")
+group_labels_pS_2g <- c("pSTAT3 low/int" = "pSTAT3 low/int",
+                        "pSTAT3 high"    = "pSTAT3 high")
+plot_boxplot_gene_pS_2g <- function(gene_name, data, colors, labels_display, output_dir, file_prefix) {
+  
+  df <- data %>%
+    filter(gene_clean == gene_name) %>%
+    mutate(ps_group = droplevels(factor(ps_group, levels = c("pSTAT3 low/int", "pSTAT3 high"))))
+  
+  wt      <- wilcox.test(expression ~ ps_group, data = df)
+  p_label <- ifelse(wt$p.value < 0.05,
+                    paste0("p = ", formatC(wt$p.value, format = "f", digits = 3), " *"),
+                    paste0("p = ", formatC(wt$p.value, format = "f", digits = 3)))
+  
+  y_max   <- max(df$expression, na.rm = TRUE)
+  y_min   <- min(df$expression, na.rm = TRUE)
+  y_range <- y_max - y_min
+  y_annot <- y_max + y_range * 0.12
+  
+  p <- ggplot(df, aes(x = ps_group, y = expression, fill = ps_group)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.75, width = 0.45,
+                 color = "grey30", linewidth = 0.5) +
+    geom_jitter(aes(color = ps_group), width = 0.12, size = 2.2,
+                alpha = 0.85, show.legend = FALSE) +
+    annotate("text",
+             x = 1.5, y = y_annot + y_range * 0.05,
+             label = p_label, size = 3.8, color = "grey20") +
+    scale_fill_manual(values  = colors) +
+    scale_color_manual(values = colors) +
+    scale_x_discrete(labels  = labels_display) +
+    coord_cartesian(ylim = c(y_min - y_range * 0.05,
+                             y_annot + y_range * 0.15)) +
+    labs(title = gene_name, x = NULL, y = "log2 Expression") +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title      = element_text(face = "bold", hjust = 0.5, size = 13),
+      legend.position = "none",
+      axis.text.x     = element_text(size = 9, color = "grey20", angle = 20, hjust = 1),
+      axis.text.y     = element_text(size = 10),
+      axis.title.y    = element_text(size = 10)
+    )
+  
+  ggsave(
+    filename = file.path(output_dir, paste0(file_prefix, gene_name, ".png")),
+    plot     = p, width = 3.5, height = 4.5, dpi = 300
+  )
+  
+  return(p)
+}
+plots_list_pS_CB_2g <- lapply(genes_of_interest, plot_boxplot_gene_pS_2g,
+                              data           = db_boxplot_pS_CB_2g,
+                              colors         = group_colors_pS_2g,
+                              labels_display = group_labels_pS_2g,
+                              output_dir     = output_dir,
+                              file_prefix    = "Boxplot_pSTAT3_2g_CB_")
+names(plots_list_pS_CB_2g) <- genes_of_interest
+panel_pS_CB_2g <- cowplot::plot_grid(plotlist = plots_list_pS_CB_2g, ncol = 2, nrow = 2, align = "hv")
+panel_title_pS_CB_2g <- cowplot::ggdraw() +
+  cowplot::draw_label("Expression by pSTAT3 group (low/int vs high) — Clinical benefit",
+                      fontface = "bold", size = 13, x = 0.5, hjust = 0.5)
+panel_final_pS_CB_2g <- cowplot::plot_grid(panel_title_pS_CB_2g, panel_pS_CB_2g,
+                                           ncol = 1, rel_heights = c(0.06, 1))
+print(panel_final_pS_CB_2g)
+ggsave(
+  filename = file.path(output_dir, "Boxplots_pSTAT3_2g_CB_4genes_panel.png"),
+  plot     = panel_final_pS_CB_2g, width = 8, height = 9, dpi = 300
+)
+```
+
+
+```{r boxplots anna2}
+db_boxplot_pS_NCB_2g <- db_completa_log2 %>%
+  filter(clinical_benefit == 0) %>%
+  mutate(
+    ps_group = cut(
+      haven::zap_labels(pSTAT3_Histoscore),
+      breaks = c(-Inf, 73, Inf),
+      labels = c("pSTAT3 low/int", "pSTAT3 high"),
+      right  = TRUE
+    ),
+    ps_group = factor(ps_group, levels = c("pSTAT3 low/int", "pSTAT3 high"))
+  ) %>%
+  filter(!is.na(ps_group)) %>%
+  dplyr::select(Codi_Noray, ps_group, starts_with("Endogenous_")) %>%
+  pivot_longer(
+    cols      = starts_with("Endogenous_"),
+    names_to  = "gene_raw",
+    values_to = "expression"
+  ) %>%
+  mutate(
+    gene_clean = gene_raw %>%
+      str_extract("(?<=Endogenous_).*") %>%
+      str_remove("_[NX][MR]_\\d+\\.?\\d*$"),
+    ps_group   = factor(ps_group, levels = c("pSTAT3 low/int", "pSTAT3 high"))
+  ) %>%
+  filter(gene_clean %in% genes_of_interest)
+plots_list_pS_NCB_2g <- lapply(genes_of_interest, plot_boxplot_gene_pS_2g,
+                               data           = db_boxplot_pS_NCB_2g,
+                               colors         = group_colors_pS_2g,
+                               labels_display = group_labels_pS_2g,
+                               output_dir     = output_dir,
+                               file_prefix    = "Boxplot_pSTAT3_2g_NCB_")
+names(plots_list_pS_NCB_2g) <- genes_of_interest
+panel_pS_NCB_2g <- cowplot::plot_grid(plotlist = plots_list_pS_NCB_2g, ncol = 2, nrow = 2, align = "hv")
+panel_title_pS_NCB_2g <- cowplot::ggdraw() +
+  cowplot::draw_label("Expression by pSTAT3 group (low/int vs high) — No clinical benefit",
+                      fontface = "bold", size = 13, x = 0.5, hjust = 0.5)
+panel_final_pS_NCB_2g <- cowplot::plot_grid(panel_title_pS_NCB_2g, panel_pS_NCB_2g,
+                                            ncol = 1, rel_heights = c(0.06, 1))
+print(panel_final_pS_NCB_2g)
+ggsave(
+  filename = file.path(output_dir, "Boxplots_pSTAT3_2g_NCB_4genes_panel.png"),
+  plot     = panel_final_pS_NCB_2g, width = 8, height = 9, dpi = 300
+)
+```
+
+
+
+
+
+
+```{r taula_estadistica_boxplots}
+library(dplyr)
+library(tidyr)
+
+# Reaprofitem els dos data frames ja en format long generats abans:
+# db_boxplot_pS_CB  (clinical_benefit == 1)
+# db_boxplot_pS_NCB (clinical_benefit == 0)
+# Cal haver executat els dos chunks anteriors.
+
+db_long_pS <- bind_rows(
+  db_boxplot_pS_CB  %>% mutate(cohort = "Clinical benefit"),
+  db_boxplot_pS_NCB %>% mutate(cohort = "No clinical benefit")
+)
+
+# --- Estadístics descriptius per gen × grup pSTAT3 × cohort ---
+resum_desc <- db_long_pS %>%
+  group_by(gene_clean, ps_group, cohort) %>%
+  summarise(
+    n      = sum(!is.na(expression)),
+    mean   = mean(expression, na.rm = TRUE),
+    median = median(expression, na.rm = TRUE),
+    sd     = sd(expression, na.rm = TRUE),
+    IQR    = IQR(expression, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Taula ampla: una fila per gen × grup, columnes per cohort
+resum_wide <- resum_desc %>%
+  pivot_wider(
+    names_from  = cohort,
+    values_from = c(n, mean, median, sd, IQR),
+    names_sep   = "_"
+  )
+
+# --- Test CB vs NCB per a cada gen × grup pSTAT3 ---
+test_cb_ncb <- db_long_pS %>%
+  group_by(gene_clean, ps_group) %>%
+  summarise(
+    n_CB  = sum(cohort == "Clinical benefit"    & !is.na(expression)),
+    n_NCB = sum(cohort == "No clinical benefit" & !is.na(expression)),
+    p_value = if (length(unique(cohort[!is.na(expression)])) == 2 &&
+                  n_CB >= 1 && n_NCB >= 1 && (n_CB + n_NCB) >= 3) {
+      tryCatch(
+        wilcox.test(expression ~ cohort, exact = FALSE)$p.value,
+        error = function(e) NA_real_
+      )
+    } else {
+      NA_real_
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(
+    signif = case_when(
+      is.na(p_value)    ~ "",
+      p_value < 0.001   ~ "***",
+      p_value < 0.01    ~ "**",
+      p_value < 0.05    ~ "*",
+      TRUE              ~ "ns"
+    )
+  )
+
+# --- Taula final combinada ---
+tabla_final <- resum_wide %>%
+  left_join(test_cb_ncb, by = c("gene_clean", "ps_group")) %>%
+  arrange(gene_clean, ps_group)
+
+print(tabla_final, n = Inf, width = Inf)
+
+write.csv(
+  tabla_final,
+  file.path(output_dir, "Tabla_pSTAT3_CB_vs_NCB.csv"),
+  row.names = FALSE
+)
+```
+
+
+```{r print_taula}
+library(dplyr)
+library(tidyr)
+library(gt)
+
+# Requereix haver executat els chunks anteriors (db_long_pS).
+# Si no:
+# db_long_pS <- bind_rows(
+#   db_boxplot_pS_CB  %>% mutate(cohort = "Beneficio clínico"),
+#   db_boxplot_pS_NCB %>% mutate(cohort = "No beneficio clínico")
+# )
+
+# Recalculem db_long_pS amb etiquetes en castellà
+db_long_pS <- bind_rows(
+  db_boxplot_pS_CB  %>% mutate(cohort = "Beneficio clínico"),
+  db_boxplot_pS_NCB %>% mutate(cohort = "No beneficio clínico")
+)
+
+# Traducció dels grups de pSTAT3
+trad_ps <- c("pSTAT3 low"          = "pSTAT3 bajo",
+             "pSTAT3 intermediate" = "pSTAT3 intermedio",
+             "pSTAT3 high"         = "pSTAT3 alto")
+
+resum_desc <- db_long_pS %>%
+  group_by(gene_clean, ps_group, cohort) %>%
+  summarise(
+    n      = sum(!is.na(expression)),
+    median = median(expression, na.rm = TRUE),
+    sd     = sd(expression, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+resum_wide <- resum_desc %>%
+  pivot_wider(
+    names_from  = cohort,
+    values_from = c(n, median, sd),
+    names_sep   = "__"
+  )
+
+test_cb_ncb <- db_long_pS %>%
+  group_by(gene_clean, ps_group) %>%
+  summarise(
+    n_CB  = sum(cohort == "Beneficio clínico"    & !is.na(expression)),
+    n_NCB = sum(cohort == "No beneficio clínico" & !is.na(expression)),
+    p_value = if (length(unique(cohort[!is.na(expression)])) == 2 &&
+                  n_CB >= 1 && n_NCB >= 1 && (n_CB + n_NCB) >= 3) {
+      tryCatch(
+        wilcox.test(expression ~ cohort, exact = FALSE)$p.value,
+        error = function(e) NA_real_
+      )
+    } else {
+      NA_real_
+    },
+    .groups = "drop"
+  ) %>%
+  dplyr::select(gene_clean, ps_group, p_value)
+
+tabla_final <- resum_wide %>%
+  left_join(test_cb_ncb, by = c("gene_clean", "ps_group")) %>%
+  arrange(ps_group, gene_clean) %>%
+  mutate(ps_group = recode(as.character(ps_group), !!!trad_ps)) %>%
+  dplyr::select(
+    gene_clean, ps_group,
+    `n__Beneficio clínico`, `median__Beneficio clínico`, `sd__Beneficio clínico`,
+    `n__No beneficio clínico`, `median__No beneficio clínico`, `sd__No beneficio clínico`,
+    p_value
+  )
+
+gt_tabla <- tabla_final %>%
+  gt() %>%
+  tab_header(
+    title = md("**Expresión génica por grupo de pSTAT3: beneficio clínico vs no beneficio clínico**"),
+    subtitle = md("*Mediana y desviación estándar (log2). Test de Mann-Whitney entre cohortes.*")
+  ) %>%
+  cols_label(
+    gene_clean = "Gen",
+    ps_group   = "Grupo pSTAT3",
+    `n__Beneficio clínico`      = "n",
+    `median__Beneficio clínico` = "Mediana",
+    `sd__Beneficio clínico`     = "DE",
+    `n__No beneficio clínico`      = "n",
+    `median__No beneficio clínico` = "Mediana",
+    `sd__No beneficio clínico`     = "DE",
+    p_value = "valor p"
+  ) %>%
+  tab_spanner(
+    label   = md("**Beneficio clínico**"),
+    columns = c(`n__Beneficio clínico`, `median__Beneficio clínico`, `sd__Beneficio clínico`)
+  ) %>%
+  tab_spanner(
+    label   = md("**No beneficio clínico**"),
+    columns = c(`n__No beneficio clínico`, `median__No beneficio clínico`, `sd__No beneficio clínico`)
+  ) %>%
+  fmt_number(
+    columns  = c(`median__Beneficio clínico`, `sd__Beneficio clínico`,
+                 `median__No beneficio clínico`, `sd__No beneficio clínico`),
+    decimals = 2
+  ) %>%
+  fmt_number(columns = p_value, decimals = 3) %>%
+  sub_missing(missing_text = "—") %>%
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_body(
+      columns = p_value,
+      rows    = !is.na(p_value) & p_value < 0.05
+    )
+  ) %>%
+  tab_options(
+    table.font.size            = px(12),
+    heading.title.font.size    = px(15),
+    heading.subtitle.font.size = px(12),
+    column_labels.font.weight  = "bold"
+  )
+
+gtsave(
+  gt_tabla,
+  filename = file.path(output_dir, "Tabla_pSTAT3_CB_vs_NCB.png"),
+  vwidth = 950, vheight = 700
+)
+
+gt_tabla
+```
+

@@ -1,0 +1,298 @@
+---
+title: "Tabla descriptiva cohorte NanoString - HERMION"
+author: "Gerard"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+```
+
+# 1. Carga de paquetes
+
+```{r packages}
+required_pkgs <- c("haven", "dplyr", "tidyr", "gtsummary", "flextable",
+                   "labelled", "knitr", "kableExtra", "gt", "webshot2")
+new_pkgs <- required_pkgs[!(required_pkgs %in% installed.packages()[,"Package"])]
+if(length(new_pkgs)) install.packages(new_pkgs)
+
+library(haven)
+library(dplyr)
+library(tidyr)
+library(gtsummary)
+library(labelled)
+library(knitr)
+library(kableExtra)
+library(gt)
+library(webshot2)
+```
+
+# 2. Carga de la base de datos
+
+```{r load-data}
+ruta_db <- "C:/Users/socla/Documents/data/Rawdata/Base retrospectiva HERMION 6MAIG2026 julia TFM.sav"
+
+db_cruda <- read_sav(ruta_db)
+
+cat("Dimensiones de la BD original:", dim(db_cruda), "\n")
+cat("Variables disponibles:\n")
+print(names(db_cruda))
+```
+
+# 3. Filtrado de pacientes NanoString
+
+```{r filter-nanostring}
+db_nano <- db_cruda %>%
+  filter(!is.na(NanoString) & NanoString == 1)
+
+cat("Pacientes NanoString:", nrow(db_nano), "\n")
+```
+
+# 4. Selección, renombrado y limpieza de variables
+
+```{r select-rename}
+db_limpia <- db_nano %>%
+  dplyr::select(
+    edad            = Edad_al_inicio_IT,
+    sexo            = Sexo,
+    cavidad_oral    = CavOral_si_no,
+    PDL1            = PDL1,
+    linea_IT        = `Línea_IT`,
+    mejor_respuesta = `Mejor_respuesta_a_IT`,
+    beneficio_6m    = `Beneficio_clinico_a_6mo_inicioIT`,
+    pSTAT3          = pSTAT3_Histoscore_tercils
+  ) %>%
+  mutate(across(where(is.labelled), ~ as_factor(.))) %>%
+  mutate(edad = as.numeric(edad)) %>%
+  # Eliminar niveles de factor sin observaciones.
+  mutate(across(where(is.factor), droplevels))
+
+# PD-L1: el nivel etiquetado de "desconocido" del .sav se duplicaba con la
+# fila de valores perdidos. Lo convertimos a NA para que solo aparezca UNA
+# fila de desconocidos (la que genera missing_text en la tabla).
+db_limpia <- db_limpia %>%
+  mutate(
+    PDL1 = as.character(PDL1),
+    PDL1 = trimws(PDL1),
+    PDL1 = if_else(
+      PDL1 %in% c("Desconocido", "Desconegut", "Unknown", "ND",
+                  "Sin dato", "NA", "Desc"),
+      NA_character_, PDL1
+    ),
+    PDL1 = factor(PDL1)
+  )
+
+# Categorizar edad
+db_limpia <- db_limpia %>%
+  mutate(
+    edad_cat = factor(
+      ifelse(edad < 65, "<65", "≥65"),
+      levels = c("<65", "≥65")
+    )
+  )
+
+# Recodificar beneficio_6m
+db_limpia <- db_limpia %>%
+  mutate(
+    beneficio_6m = as.character(beneficio_6m),
+    beneficio_6m = trimws(beneficio_6m),
+    beneficio_6m = case_when(
+      beneficio_6m %in% c("Si", "Sí", "SI", "sí", "1", "Yes") ~ "Sí",
+      beneficio_6m %in% c("No", "NO", "no", "0")              ~ "No",
+      TRUE                                                     ~ NA_character_
+    ),
+    beneficio_6m = factor(beneficio_6m, levels = c("Sí", "No"))
+  ) %>%
+  filter(!is.na(beneficio_6m))
+
+# Recodificar mejor_respuesta (RECIST)
+# RC = Respuesta Completa; RP = Respuesta Parcial;
+# EE = Estabilización de la Enfermedad; PE = Progresión de la Enfermedad.
+# NOTA: ajusta las cadenas de cada case_when si los valores originales del .sav
+# no coinciden con los contemplados aquí (los no reconocidos quedarán como "Desconocido").
+db_limpia <- db_limpia %>%
+  mutate(
+    mejor_respuesta = as.character(mejor_respuesta),
+    mejor_respuesta = trimws(mejor_respuesta),
+    mejor_respuesta = case_when(
+      toupper(mejor_respuesta) %in% c("RC", "CR", "RESPUESTA COMPLETA",
+                                      "COMPLETE RESPONSE", "1") ~ "Respuesta Completa (RC)",
+      toupper(mejor_respuesta) %in% c("RP", "PR", "RESPUESTA PARCIAL",
+                                      "PARTIAL RESPONSE", "2") ~ "Respuesta Parcial (RP)",
+      toupper(mejor_respuesta) %in% c("EE", "SD", "ESTABILIZACIÓN", "ESTABILIZACION",
+                                      "ENFERMEDAD ESTABLE", "STABLE DISEASE", "3") ~ "Estabilización de la Enfermedad (EE)",
+      toupper(mejor_respuesta) %in% c("PE", "PD", "PROGRESIÓN", "PROGRESION",
+                                      "ENFERMEDAD EN PROGRESIÓN", "ENFERMEDAD EN PROGRESION",
+                                      "PROGRESSIVE DISEASE", "4") ~ "Progresión de la Enfermedad (PE)",
+      TRUE ~ mejor_respuesta
+    ),
+    mejor_respuesta = factor(
+      mejor_respuesta,
+      levels = c("Respuesta Completa (RC)",
+                 "Respuesta Parcial (RP)",
+                 "Estabilización de la Enfermedad (EE)",
+                 "Progresión de la Enfermedad (PE)")
+    )
+  )
+
+cat("Distribución beneficio clínico 6m:\n")
+print(table(db_limpia$beneficio_6m, useNA = "ifany"))
+
+cat("Distribución mejor respuesta (RECIST):\n")
+print(table(db_limpia$mejor_respuesta, useNA = "ifany"))
+```
+
+# 5. Función auxiliar para decidir la prueba estadística
+
+```{r test-function}
+decide_test <- function(data, variable, by = "beneficio_6m") {
+  tab <- table(data[[variable]], data[[by]])
+  esperadas <- suppressWarnings(chisq.test(tab)$expected)
+  if (any(esperadas < 5)) "fisher.test" else "chisq.test.no.correct"
+}
+
+construye_tests <- function(data, vars) {
+  tests <- sapply(vars, decide_test, data = data)
+  lista <- lapply(seq_along(tests), function(i) {
+    as.formula(paste0(names(tests)[i], " ~ '", tests[i], "'"))
+  })
+  list(lista = lista, tests = tests)
+}
+```
+
+# 6. Variables demográficas y clínicas
+
+```{r tabla1}
+vars_t1 <- c("edad_cat", "sexo", "cavidad_oral", "linea_IT")
+t1 <- construye_tests(db_limpia, vars_t1)
+
+pie_t1 <- paste0(
+  "Pruebas estadísticas: ",
+  paste(sprintf("%s (%s)", names(t1$tests),
+                ifelse(t1$tests == "fisher.test", "Fisher exacto", "Chi-cuadrado")),
+        collapse = "; "), "."
+)
+
+tabla1 <- db_limpia %>%
+  dplyr::select(edad_cat, sexo, cavidad_oral, linea_IT, beneficio_6m) %>%
+  tbl_summary(
+    by = beneficio_6m,
+    label = list(
+      edad_cat     ~ "Edad (categórica)",
+      sexo         ~ "Sexo",
+      cavidad_oral ~ "Cavidad oral",
+      linea_IT     ~ "Línea de inmunoterapia"
+    ),
+    statistic = list(all_categorical() ~ "{n} ({p}%)"),
+    missing = "ifany",
+    missing_text = "Desconocido"
+  ) %>%
+  add_p(
+    test = t1$lista,
+    pvalue_fun = ~ style_pvalue(.x, digits = 3)
+  ) %>%
+  add_overall(col_label = "**Total** N = {N}") %>%
+  modify_header(
+    label = "**Variable**",
+    all_stat_cols() ~ "**{level}** N = {n}"
+  ) %>%
+  modify_spanning_header(
+    all_stat_cols() ~ "**Beneficio clínico a los 6 meses**"
+  ) %>%
+  modify_caption(pie_t1) %>%
+  bold_labels()
+
+tabla1
+```
+
+# 7. Respuesta a inmunoterapia y biomarcadores
+
+```{r tabla2}
+vars_t2 <- c("PDL1", "mejor_respuesta", "pSTAT3")
+t2 <- construye_tests(db_limpia, vars_t2)
+
+pie_t2 <- paste0(
+  "Pruebas estadísticas: ",
+  paste(sprintf("%s (%s)", names(t2$tests),
+                ifelse(t2$tests == "fisher.test", "Fisher exacto", "Chi-cuadrado")),
+        collapse = "; "), "."
+)
+
+tabla2 <- db_limpia %>%
+  dplyr::select(PDL1, mejor_respuesta, pSTAT3, beneficio_6m) %>%
+  tbl_summary(
+    by = beneficio_6m,
+    label = list(
+      PDL1            ~ "PD-L1",
+      mejor_respuesta ~ "Mejor respuesta a IT",
+      pSTAT3          ~ "pSTAT3 Histoscore (terciles)"
+    ),
+    statistic = list(all_categorical() ~ "{n} ({p}%)"),
+    missing = "ifany",
+    missing_text = "Desconocido"
+  ) %>%
+  add_p(
+    test = t2$lista,
+    pvalue_fun = ~ style_pvalue(.x, digits = 3)
+  ) %>%
+  add_overall(col_label = "**Total** N = {N}") %>%
+  modify_header(
+    label = "**Variable**",
+    all_stat_cols() ~ "**{level}** N = {n}"
+  ) %>%
+  modify_spanning_header(
+    all_stat_cols() ~ "**Beneficio clínico a los 6 meses**"
+  ) %>%
+  modify_caption(pie_t2) %>%
+  bold_labels()
+
+tabla2
+```
+
+# 8. Exportación a PNG
+
+```{r export-png}
+ruta_output <- "C:/Users/socla/Documents/results/clinical_cohort"
+
+if (!dir.exists(ruta_output)) {
+  dir.create(ruta_output, recursive = TRUE)
+  cat("Carpeta creada:", ruta_output, "\n")
+} else {
+  cat("Carpeta ya existe:", ruta_output, "\n")
+}
+
+tabla1 %>%
+  as_gt() %>%
+  gt::gtsave(
+    filename = "tabla_demografica_clinica.png",
+    path = ruta_output,
+    vwidth = 1200,
+    vheight = 900,
+    expand = 20
+  )
+
+tabla2 %>%
+  as_gt() %>%
+  gt::gtsave(
+    filename = "tabla_respuesta_biomarcadores.png",
+    path = ruta_output,
+    vwidth = 1200,
+    vheight = 700,
+    expand = 20
+  )
+
+cat("Tablas guardadas en:", ruta_output, "\n")
+```
+
+

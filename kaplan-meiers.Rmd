@@ -1,0 +1,155 @@
+
+
+
+```{r kaplanmeier}
+# =============================================================================
+# KAPLAN-MEIER: PDL1+ vs PDL1- | TTP y OS
+# Cohorte HERMION | TFM Gerard
+# =============================================================================
+
+library(haven)
+library(dplyr)
+library(labelled)
+library(survival)
+library(survminer)
+
+# --- 1. Carga y preparación de datos -----------------------------------------
+
+ruta_db <- "C:/Users/socla/Documents/data/Rawdata/Base retrospectiva HERMION 6MAIG2026 julia TFM.sav"
+
+db_raw <- read_sav(ruta_db) |> zap_labels()
+
+db <- db_raw |>
+  mutate(
+    PDL1_grup = factor(PDL1,
+                       levels = c(0, 1),
+                       labels = c("PDL1−", "PDL1+")),
+    TTP_months = as.numeric(TTP_months),
+    TTD_months = as.numeric(TTD_months),
+    iPE        = as.numeric(iPE),
+    Estado_UC  = as.numeric(Estado_UC)
+  ) |>
+  filter(!is.na(PDL1_grup))
+
+cat("N total disponible para KM:", nrow(db), "\n")
+cat("Distribución PDL1:\n")
+print(table(db$PDL1_grup, useNA = "always"))
+
+# --- 2. Objetos de supervivencia ---------------------------------------------
+
+surv_ttp <- Surv(time  = db$TTP_months,
+                 event = db$iPE)
+
+surv_os  <- Surv(time  = db$TTD_months,
+                 event = db$Estado_UC)
+
+# --- 3. Ajuste KM ------------------------------------------------------------
+
+km_ttp <- survfit(surv_ttp ~ PDL1_grup, data = db)
+km_os  <- survfit(surv_os  ~ PDL1_grup, data = db)
+
+# Log-rank test
+lr_ttp <- survdiff(surv_ttp ~ PDL1_grup, data = db)
+lr_os  <- survdiff(surv_os  ~ PDL1_grup, data = db)
+
+cat("\n--- Log-rank TTP ---\n"); print(lr_ttp)
+cat("\n--- Log-rank OS ---\n");  print(lr_os)
+
+# --- 4. Paleta y estética comunes --------------------------------------------
+
+cols_pdl1 <- c("PDL1−" = "#E05C5C",   # rojo apagado
+                "PDL1+" = "#4A90D9")   # azul
+
+km_theme <- theme_classic(base_size = 13) +
+  theme(
+    legend.position   = "top",
+    legend.title      = element_blank(),
+    plot.title        = element_text(face = "bold", size = 14),
+    plot.subtitle     = element_text(size = 11, color = "grey40"),
+    axis.title        = element_text(size = 12),
+    panel.grid.major.y = element_line(color = "grey92")
+  )
+
+# Función para extraer p-value del log-rank
+lr_pval <- function(lr_obj) {
+  p <- 1 - pchisq(lr_obj$chisq, df = length(lr_obj$n) - 1)
+  ifelse(p < 0.001, "p < 0.001",
+         ifelse(p < 0.01, paste0("p = ", round(p, 3)),
+                paste0("p = ", round(p, 2))))
+}
+
+# --- 5. Plot TTP -------------------------------------------------------------
+
+p_ttp <- ggsurvplot(
+  km_ttp,
+  data          = db,
+  palette       = cols_pdl1,
+  conf.int      = TRUE,
+  conf.int.alpha = 0.12,
+  pval          = FALSE,          # añadimos manualmente
+  risk.table    = TRUE,
+  risk.table.height = 0.28,
+  risk.table.title  = "Pacientes en riesgo",
+  risk.table.y.text = FALSE,
+  xlab          = "Tiempo (meses)",
+  ylab          = "Probabilidad de no progresión",
+  title         = "Tiempo hasta progresión (TTP)",
+  subtitle      = paste0("PDL1+ vs PDL1−  |  Log-rank ", lr_pval(lr_ttp)),
+  legend.labs   = c("PDL1−", "PDL1+"),
+  ggtheme       = km_theme,
+  fontsize      = 4,
+  tables.theme  = theme_cleantable()
+)
+
+# --- 6. Plot OS --------------------------------------------------------------
+
+p_os <- ggsurvplot(
+  km_os,
+  data          = db,
+  palette       = cols_pdl1,
+  conf.int      = TRUE,
+  conf.int.alpha = 0.12,
+  pval          = FALSE,
+  risk.table    = TRUE,
+  risk.table.height = 0.28,
+  risk.table.title  = "Pacientes en riesgo",
+  risk.table.y.text = FALSE,
+  xlab          = "Tiempo (meses)",
+  ylab          = "Probabilidad de supervivencia global",
+  title         = "Supervivencia global (OS)",
+  subtitle      = paste0("PDL1+ vs PDL1−  |  Log-rank ", lr_pval(lr_os)),
+  legend.labs   = c("PDL1−", "PDL1+"),
+  ggtheme       = km_theme,
+  fontsize      = 4,
+  tables.theme  = theme_cleantable()
+)
+
+# --- 7. Guardar figuras ------------------------------------------------------
+
+ruta_out <- "C:/Users/socla/Documents/results/clinical_cohort/"
+
+# TTP
+png(filename = paste0(ruta_out, "KM_TTP_PDL1.png"),
+    width = 2400, height = 2000, res = 300)
+print(p_ttp)
+dev.off()
+
+# OS
+png(filename = paste0(ruta_out, "KM_OS_PDL1.png"),
+    width = 2400, height = 2000, res = 300)
+print(p_os)
+dev.off()
+
+# Panel combinado (opcional)
+png(filename = paste0(ruta_out, "KM_TTP_OS_PDL1_panel.png"),
+    width = 4800, height = 2000, res = 300)
+arrange_ggsurvplots(list(p_ttp, p_os), ncol = 2, nrow = 1)
+dev.off()
+
+cat("\nFiguras guardadas en:", ruta_out, "\n")
+
+# --- 8. Resumen medianas de supervivencia ------------------------------------
+
+cat("\n--- Resumen KM TTP ---\n"); print(km_ttp)
+cat("\n--- Resumen KM OS ---\n");  print(km_os)
+```
