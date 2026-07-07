@@ -19,10 +19,6 @@ Repositorio de código correspondiente al Trabajo de Fin de Máster (TFM) del pr
 - **RStudio**: versión 2025.09.2+418 "Cucumberleaf Sunflower"
 - **Paquetes principales**: Bioconductor (procesamiento de datos ómicos y NanoString), `limma`, `patchwork`, `ggplot2`
 
-## Nota
-
-Este repositorio se ha creado con el único propósito de permitir la consulta del código por parte del tribunal evaluador del TFM. Todos los derechos reservados.
-
 ## Autora
 
 Júlia Francisco
