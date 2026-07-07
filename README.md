@@ -2,7 +2,7 @@
 
 ## Descripción
 
-Repositorio de código correspondiente al Trabajo de Fin de Máster (TFM) del proyecto **HERMION-3**, centrado en el estudio de la respuesta a inmunoterapia en el carcinoma escamoso de cabeza y cuello (HNSCC) mediante análisis transcriptómico con el panel NanoString® nCounter PanCancer IO 360™, con especial atención a la vía de señalización STAT3 y a los mecanismos de resistencia a la inmunoterapia.
+Repositorio de código correspondiente al Trabajo de Fin de Máster (TFM) del proyecto **HERMION-3**, centrado en el estudio de la respuesta a inmunoterapia en el carcinoma escamoso de cabeza y cuello (HNSCC) mediante análisis transcriptómico con el panel NanoString® nCounter PanCancer IO 360™, con especial atención a la vía de señalización STAT3.
 
 ## Estructura del repositorio
 - **1.2_Analisis_NanoString_IO360.Rmd** — Análisis de los datos NanoString IO360 tras la normalización.
